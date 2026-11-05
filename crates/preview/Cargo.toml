@@ -8,4 +8,5 @@ repository.workspace = true
 [dependencies]
 egui.workspace = true
 egui_extras.workspace = true
+markdown = { path = "../markdown" }
 pulldown-cmark.workspace = true

@@ -3,7 +3,7 @@
 //! Поддерживается: заголовки, абзацы, emphasis/strong/strikethrough,
 //! inline-код, код-блоки (с подсветкой syntect), цитаты, списки (в т.ч.
 //! упорядоченные и задачи), таблицы, горизонтальные линии, сноски,
-//! frontmatter (YAML-шапка).
+//! frontmatter. Wikilinks `[[target]]` рендерятся кликабельными ссылками.
 
 use std::iter::Peekable;
 
@@ -11,66 +11,58 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{FontId, Margin, RichText, Stroke, TextStyle, Ui};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// Рисует markdown-текст в `ui`.
-pub fn markdown(ui: &mut Ui, text: &str) {
-    let (frontmatter, body) = split_frontmatter(text);
-    if let Some(fm) = frontmatter {
-        render_frontmatter(ui, &fm);
-    }
-    render_body(ui, body);
+/// Действие, которое пользователь запросил в предпросмотре.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Клик по wikilink с целью `target` (без расширения).
+    OpenWiki(String),
 }
 
-// ---------------------------------------------------------------------------
-// Frontmatter
-// ---------------------------------------------------------------------------
+/// Рисует markdown-текст в `ui`. Возвращает действия (например, клики по ссылкам).
+pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
+    let mut actions = Vec::new();
 
-/// Отделяет YAML-шапку `--- ... ---` в начале документа.
-fn split_frontmatter(text: &str) -> (Option<Vec<(String, String)>>, &str) {
-    let mut iter = text.split_inclusive('\n');
-    let Some(first) = iter.next() else {
-        return (None, text);
+    let (frontmatter, body) = match markdown::split_frontmatter(text) {
+        Some((fm, body)) => (Some(fm), body),
+        None => (None, text),
     };
-    if first.trim() != "---" {
-        return (None, text);
+    if let Some(fm) = &frontmatter {
+        render_frontmatter(ui, fm);
     }
 
-    let mut kv = Vec::new();
-    let mut consumed = first.len();
-    let mut closed = false;
-    for line in iter {
-        if line.trim() == "---" {
-            consumed += line.len();
-            closed = true;
-            break;
-        }
-        consumed += line.len();
-        let line = line.trim_end_matches(['\n', '\r']);
-        if let Some((k, v)) = line.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
-            if !k.is_empty() {
-                kv.push((k.to_string(), v.to_string()));
-            }
-        }
-    }
-    if closed {
-        (Some(kv), &text[consumed..])
-    } else {
-        (None, text)
-    }
+    let body = wiki_links_to_md(body);
+    render_body(ui, &body, &mut actions);
+    actions
 }
 
-fn render_frontmatter(ui: &mut Ui, fm: &[(String, String)]) {
+/// Заменяет `[[target|alias]]` на `[alias](wiki:target)` в тексте вне кода.
+fn wiki_links_to_md(text: &str) -> String {
+    let links = markdown::extract_wikilinks(text);
+    if links.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for w in links {
+        out.push_str(&text[last..w.range.start]);
+        let label = w.alias.as_deref().unwrap_or(&w.target);
+        out.push_str(&format!("[{label}](wiki:{})", w.target));
+        last = w.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn render_frontmatter(ui: &mut Ui, fm: &markdown::Frontmatter) {
     egui::Frame::group(ui.style())
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
             egui::CollapsingHeader::new("Metadata")
                 .default_open(false)
                 .show(ui, |ui| {
-                    for (k, v) in fm {
+                    for (k, v) in &fm.pairs {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(k).color(ui.visuals().weak_text_color()),
-                            );
+                            ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
                             ui.label(v);
                         });
                     }
@@ -82,34 +74,34 @@ fn render_frontmatter(ui: &mut Ui, fm: &[(String, String)]) {
 // Блоки
 // ---------------------------------------------------------------------------
 
-fn render_body(ui: &mut Ui, md: &str) {
+fn render_body(ui: &mut Ui, md: &str, actions: &mut Vec<Action>) {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
     let parser = Parser::new_ext(md, options);
-    render_blocks(ui, &mut parser.peekable());
+    render_blocks(ui, &mut parser.peekable(), actions);
 }
 
-fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
+fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
     while let Some(ev) = events.peek().cloned() {
         match ev {
             Event::Start(Tag::Paragraph) => {
                 events.next();
-                render_inline(ui, events, InlineStop::Paragraph);
+                render_inline(ui, events, InlineStop::Paragraph, actions);
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 events.next();
-                render_heading(ui, events, level);
+                render_heading(ui, events, level, actions);
             }
             Event::Start(Tag::List(start)) => {
                 events.next();
-                render_list(ui, events, start);
+                render_list(ui, events, start, actions);
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 events.next();
-                render_blockquote(ui, events);
+                render_blockquote(ui, events, actions);
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 events.next();
@@ -123,7 +115,13 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
                 events.next();
                 ui.indent("footnote", |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        render_inline_with(ui, events, InlineStop::FootnoteDef, small_format(ui));
+                        render_inline_with(
+                            ui,
+                            events,
+                            InlineStop::FootnoteDef,
+                            small_format(ui),
+                            actions,
+                        );
                     });
                 });
             }
@@ -138,30 +136,30 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
             }
             _ => {
                 // «Рыхлый» инлайн без абзаца — на всякий случай.
-                render_inline(ui, events, InlineStop::None);
+                render_inline(ui, events, InlineStop::None, actions);
             }
         }
     }
 }
 
 /// Рендер одного блока (для вложенного контента: внутри пунктов списков и цитат).
-fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
+fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
     match events.peek().cloned() {
         Some(Event::Start(Tag::Paragraph)) => {
             events.next();
-            render_inline(ui, events, InlineStop::Paragraph);
+            render_inline(ui, events, InlineStop::Paragraph, actions);
         }
         Some(Event::Start(Tag::Heading { level, .. })) => {
             events.next();
-            render_heading(ui, events, level);
+            render_heading(ui, events, level, actions);
         }
         Some(Event::Start(Tag::List(start))) => {
             events.next();
-            render_list(ui, events, start);
+            render_list(ui, events, start, actions);
         }
         Some(Event::Start(Tag::BlockQuote(_))) => {
             events.next();
-            render_blockquote(ui, events);
+            render_blockquote(ui, events, actions);
         }
         Some(Event::Start(Tag::CodeBlock(kind))) => {
             events.next();
@@ -175,7 +173,12 @@ fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
     }
 }
 
-fn render_heading(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, level: HeadingLevel) {
+fn render_heading(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    level: HeadingLevel,
+    actions: &mut Vec<Action>,
+) {
     let base = body_size(ui);
     let size = match level {
         HeadingLevel::H1 => base * 1.9,
@@ -191,18 +194,23 @@ fn render_heading(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, level: Heading
         color: ui.visuals().strong_text_color(),
         ..Default::default()
     };
-    render_inline_with(ui, events, InlineStop::Heading(level), fmt);
+    render_inline_with(ui, events, InlineStop::Heading(level), fmt, actions);
     ui.add_space(size * 0.15);
 }
 
-fn render_list(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, start: Option<u64>) {
+fn render_list(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    start: Option<u64>,
+    actions: &mut Vec<Action>,
+) {
     let ordered = start.is_some();
     let mut n = start.unwrap_or(1);
     loop {
         match events.peek() {
             Some(Event::Start(Tag::Item)) => {
                 events.next();
-                render_item(ui, events, ordered, n);
+                render_item(ui, events, ordered, n, actions);
                 n += 1;
             }
             Some(Event::End(TagEnd::List(_))) => {
@@ -217,7 +225,13 @@ fn render_list(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, start: Option<u64
     }
 }
 
-fn render_item(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, ordered: bool, index: u64) {
+fn render_item(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    ordered: bool,
+    index: u64,
+    actions: &mut Vec<Action>,
+) {
     // Задачи: `- [ ] ...` / `- [x] ...`. Маркер может идти сразу или после
     // Start(Paragraph) («рыхлые» списки).
     if matches!(events.peek(), Some(Event::Start(Tag::Paragraph))) {
@@ -247,7 +261,7 @@ fn render_item(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, ordered: bool, in
                 ui.label(RichText::new(marker).monospace());
             }
         }
-        render_inline(ui, events, InlineStop::Item);
+        render_inline(ui, events, InlineStop::Item, actions);
     });
 
     // Вложенные блоки (вложенные списки, код, цитаты…)
@@ -258,7 +272,7 @@ fn render_item(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, ordered: bool, in
                 break;
             }
             Some(Event::Start(_)) => {
-                ui.indent("nested", |ui| render_block_once(ui, events));
+                ui.indent("nested", |ui| render_block_once(ui, events, actions));
             }
             Some(_) => {
                 events.next();
@@ -268,7 +282,7 @@ fn render_item(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, ordered: bool, in
     }
 }
 
-fn render_blockquote(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
+fn render_blockquote(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
     egui::Frame::default()
         .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(
@@ -284,7 +298,7 @@ fn render_blockquote(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
                         events.next();
                         break;
                     }
-                    Some(Event::Start(_)) => render_block_once(ui, events),
+                    Some(Event::Start(_)) => render_block_once(ui, events, actions),
                     Some(_) => {
                         events.next();
                     }
@@ -340,37 +354,36 @@ fn render_table(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
     let mut row: Vec<String> = Vec::new();
     let mut row_is_head = false;
 
-    loop {
-        match events.peek().cloned() {
-            Some(Event::Start(Tag::TableHead)) => {
+    while let Some(ev) = events.peek().cloned() {
+        match ev {
+            Event::Start(Tag::TableHead) => {
                 events.next();
                 in_head = true;
             }
-            Some(Event::End(TagEnd::TableHead)) => {
+            Event::End(TagEnd::TableHead) => {
                 events.next();
                 in_head = false;
             }
-            Some(Event::Start(Tag::TableRow)) => {
+            Event::Start(Tag::TableRow) => {
                 events.next();
                 row.clear();
                 row_is_head = in_head;
             }
-            Some(Event::Start(Tag::TableCell)) => {
+            Event::Start(Tag::TableCell) => {
                 events.next();
                 row.push(collect_plain_text(events, TagEnd::TableCell));
             }
-            Some(Event::End(TagEnd::TableRow)) => {
+            Event::End(TagEnd::TableRow) => {
                 events.next();
                 rows.push((row_is_head, row.clone()));
             }
-            Some(Event::End(TagEnd::Table)) => {
+            Event::End(TagEnd::Table) => {
                 events.next();
                 break;
             }
-            Some(_) => {
+            _ => {
                 events.next();
             }
-            None => break,
         }
     }
 
@@ -414,6 +427,13 @@ enum InlineStop {
     Item,
     /// До первого блока.
     None,
+}
+
+/// Диапазон символов кликабельного wikilink внутри LayoutJob.
+struct LinkRange {
+    start: usize,
+    end: usize,
+    target: String,
 }
 
 fn is_block_start(ev: &Event<'_>) -> bool {
@@ -465,9 +485,14 @@ fn body_size(ui: &Ui) -> f32 {
         .unwrap_or(14.0)
 }
 
-fn render_inline(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, stop: InlineStop) {
+fn render_inline(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    stop: InlineStop,
+    actions: &mut Vec<Action>,
+) {
     let fmt = base_format(ui);
-    render_inline_with(ui, events, stop, fmt);
+    render_inline_with(ui, events, stop, fmt, actions);
 }
 
 fn render_inline_with(
@@ -475,23 +500,54 @@ fn render_inline_with(
     events: &mut Peekable<Parser<'_>>,
     stop: InlineStop,
     base: TextFormat,
+    actions: &mut Vec<Action>,
 ) {
-    let job = collect_inline(ui, events, stop, base);
+    let (job, links) = collect_inline(ui, events, stop, base);
     if !job.text.is_empty() {
-        ui.label(job);
+        render_job(ui, job, &links, actions);
+    }
+}
+
+/// Рисует LayoutJob и обрабатывает клики по wikilinks внутри него.
+fn render_job(
+    ui: &mut Ui,
+    job: LayoutJob,
+    links: &[LinkRange],
+    actions: &mut Vec<Action>,
+) {
+    let response = ui.label(job.clone());
+    if !links.is_empty() && response.clicked() {
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        if let Some(pos) = response.interact_pointer_pos() {
+            let local = pos - response.rect.min;
+            let cursor = galley.cursor_from_pos(local);
+            let idx = cursor.index.0;
+            if let Some(lr) = links.iter().find(|lr| lr.start <= idx && idx <= lr.end) {
+                actions.push(Action::OpenWiki(lr.target.clone()));
+            }
+        }
     }
 }
 
 /// Собирает инлайн-события в `LayoutJob` до условия остановки.
+/// Возвращает также диапазоны wikilinks для hit-testing.
 fn collect_inline(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
     stop: InlineStop,
     base: TextFormat,
-) -> LayoutJob {
+) -> (LayoutJob, Vec<LinkRange>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
     let mut stack: Vec<TextFormat> = vec![base];
+    let mut links: Vec<LinkRange> = Vec::new();
+    let mut open_wiki: Option<(usize, String)> = None;
+    let mut char_cursor = 0usize;
+
+    let push = |job: &mut LayoutJob, s: &str, f: TextFormat, cursor: &mut usize| {
+        job.append(s, 0.0, f);
+        *cursor += s.chars().count();
+    };
 
     while let Some(ev) = events.peek().cloned() {
         if should_stop(&ev, stop) {
@@ -517,12 +573,15 @@ fn collect_inline(
                 f.strikethrough = Stroke::new(1.0, f.color);
                 stack.push(f);
             }
-            Event::Start(Tag::Link { .. }) => {
+            Event::Start(Tag::Link { dest_url, .. }) => {
                 events.next();
                 let mut f = stack.last().unwrap().clone();
                 f.color = ui.visuals().hyperlink_color;
                 f.underline = Stroke::new(1.0, ui.visuals().hyperlink_color);
                 stack.push(f);
+                if let Some(target) = dest_url.strip_prefix("wiki:") {
+                    open_wiki = Some((char_cursor, target.to_string()));
+                }
             }
             Event::Start(Tag::Image { .. }) => {
                 events.next();
@@ -542,6 +601,15 @@ fn collect_inline(
                 if stack.len() > 1 {
                     stack.pop();
                 }
+                if matches!(ev, Event::End(TagEnd::Link)) {
+                    if let Some((start, target)) = open_wiki.take() {
+                        links.push(LinkRange {
+                            start,
+                            end: char_cursor,
+                            target,
+                        });
+                    }
+                }
             }
             Event::End(TagEnd::Paragraph) => {
                 // Прозрачно для «рыхлых» списков.
@@ -557,37 +625,62 @@ fn collect_inline(
             }
             Event::Text(t) => {
                 events.next();
-                job.append(&t, 0.0, stack.last().unwrap().clone());
+                push(
+                    &mut job,
+                    &t,
+                    stack.last().unwrap().clone(),
+                    &mut char_cursor,
+                );
             }
             Event::Code(c) => {
                 events.next();
                 let mut f = stack.last().unwrap().clone();
                 f.font_id = FontId::monospace(f.font_id.size * 0.92);
                 f.background = ui.visuals().faint_bg_color;
-                job.append(&c, 0.0, f);
+                push(&mut job, &c, f, &mut char_cursor);
             }
             Event::SoftBreak => {
                 events.next();
-                job.append(" ", 0.0, stack.last().unwrap().clone());
+                push(
+                    &mut job,
+                    " ",
+                    stack.last().unwrap().clone(),
+                    &mut char_cursor,
+                );
             }
             Event::HardBreak => {
                 events.next();
-                job.append("\n", 0.0, stack.last().unwrap().clone());
+                push(
+                    &mut job,
+                    "\n",
+                    stack.last().unwrap().clone(),
+                    &mut char_cursor,
+                );
             }
             Event::InlineHtml(h) => {
                 events.next();
-                job.append(&h, 0.0, stack.last().unwrap().clone());
+                push(
+                    &mut job,
+                    &h,
+                    stack.last().unwrap().clone(),
+                    &mut char_cursor,
+                );
             }
             Event::InlineMath(m) => {
                 events.next();
-                job.append(&m, 0.0, stack.last().unwrap().clone());
+                push(
+                    &mut job,
+                    &m,
+                    stack.last().unwrap().clone(),
+                    &mut char_cursor,
+                );
             }
             Event::FootnoteReference(r) => {
                 events.next();
                 let mut f = stack.last().unwrap().clone();
                 f.font_id = FontId::proportional(f.font_id.size * 0.75);
                 f.color = ui.visuals().hyperlink_color;
-                job.append(&format!("[{r}]"), 0.0, f);
+                push(&mut job, &format!("[{r}]"), f, &mut char_cursor);
             }
             Event::Rule | Event::DisplayMath(_) | Event::TaskListMarker(_) => {
                 events.next();
@@ -599,7 +692,7 @@ fn collect_inline(
         }
     }
 
-    job
+    (job, links)
 }
 
 /// Собирает только текст (для ячеек таблиц).
@@ -644,41 +737,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frontmatter_split() {
-        let text = "---\ntitle: Hi\ntags: a, b\n---\nBody\n";
-        let (fm, body) = split_frontmatter(text);
-        assert_eq!(
-            fm,
-            Some(vec![
-                ("title".to_string(), "Hi".to_string()),
-                ("tags".to_string(), "a, b".to_string()),
-            ])
-        );
-        assert_eq!(body, "Body\n");
+    fn wiki_links_transformed() {
+        let md = wiki_links_to_md("См. [[Заметка]] и [[Другая|алиас]].");
+        assert_eq!(md, "См. [Заметка](wiki:Заметка) и [алиас](wiki:Другая).");
     }
 
     #[test]
-    fn frontmatter_split_crlf() {
-        let text = "---\r\ntitle: Hi\r\n---\r\nBody\r\n";
-        let (fm, body) = split_frontmatter(text);
-        assert_eq!(fm, Some(vec![("title".to_string(), "Hi".to_string())]));
-        assert_eq!(body, "Body\r\n");
-    }
-
-    #[test]
-    fn no_frontmatter() {
-        let text = "# Just a heading\n";
-        let (fm, body) = split_frontmatter(text);
-        assert!(fm.is_none());
-        assert_eq!(body, text);
-    }
-
-    #[test]
-    fn unterminated_frontmatter_is_kept() {
-        let text = "---\ntitle: Hi\nbody text\n";
-        let (fm, body) = split_frontmatter(text);
-        assert!(fm.is_none());
-        assert_eq!(body, text);
+    fn wiki_links_untouched_in_code() {
+        let md = wiki_links_to_md("`[[не ссылка]]`");
+        assert_eq!(md, "`[[не ссылка]]`");
     }
 
     #[test]
