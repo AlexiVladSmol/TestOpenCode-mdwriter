@@ -1,12 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod tree;
+
+use std::path::PathBuf;
+use std::time::Duration;
+
 use eframe::egui;
+
+use vault::{Vault, VaultWatcher};
+
+const AUTOSAVE_DELAY: f64 = 1.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([600.0, 400.0])
+            .with_inner_size([1100.0, 720.0])
+            .with_min_inner_size([700.0, 450.0])
             .with_title("mdwriter"),
         ..Default::default()
     };
@@ -20,34 +29,231 @@ fn main() -> eframe::Result {
 
 #[derive(Default)]
 struct App {
-    vault_path: Option<std::path::PathBuf>,
+    vault: Option<VaultState>,
+}
+
+struct VaultState {
+    vault: Vault,
+    watcher: VaultWatcher,
+    notes: Vec<PathBuf>,
+    tree: Vec<tree::TreeNode>,
+    open: Option<PathBuf>,
+    editor_text: String,
+    dirty: bool,
+    last_edit: Option<f64>,
+    new_note_name: String,
+}
+
+impl VaultState {
+    fn open(vault: Vault, watcher: VaultWatcher) -> Self {
+        let mut s = Self {
+            vault,
+            watcher,
+            notes: Vec::new(),
+            tree: Vec::new(),
+            open: None,
+            editor_text: String::new(),
+            dirty: false,
+            last_edit: None,
+            new_note_name: String::new(),
+        };
+        s.rescan();
+        s
+    }
+
+    fn rescan(&mut self) {
+        if let Ok(notes) = self.vault.list_notes() {
+            self.notes = notes;
+            self.tree = tree::build_tree(&self.notes);
+        }
+        // Если открытая заметка исчезла — закрываем её.
+        if let Some(rel) = &self.open {
+            if !self.notes.contains(rel) {
+                self.open = None;
+                self.editor_text.clear();
+                self.dirty = false;
+                self.last_edit = None;
+            }
+        }
+    }
+
+    fn load(&mut self, rel: PathBuf) {
+        self.flush();
+        match self.vault.read(&rel) {
+            Ok(text) => {
+                self.editor_text = text;
+                self.dirty = false;
+                self.last_edit = None;
+                self.open = Some(rel);
+            }
+            Err(e) => eprintln!("failed to read {}: {e}", rel.display()),
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.dirty {
+            if let Some(rel) = &self.open {
+                if let Err(e) = self.vault.write(rel, &self.editor_text) {
+                    eprintln!("failed to save {}: {e}", rel.display());
+                }
+            }
+            self.dirty = false;
+        }
+    }
+
+    fn maybe_autosave(&mut self, now: f64, ctx: &egui::Context) {
+        if !self.dirty {
+            return;
+        }
+        match self.last_edit {
+            None => self.flush(),
+            Some(t) => {
+                let elapsed = now - t;
+                if elapsed >= AUTOSAVE_DELAY {
+                    self.flush();
+                } else {
+                    ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_DELAY - elapsed));
+                }
+            }
+        }
+    }
+
+    fn create_note(&mut self) {
+        let name = self.new_note_name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let name = if name.ends_with(".md") {
+            name
+        } else {
+            format!("{name}.md")
+        };
+        let rel = PathBuf::from(name);
+        if let Err(e) = self.vault.create(&rel) {
+            eprintln!("failed to create {rel:?}: {e}");
+            return;
+        }
+        self.new_note_name.clear();
+        self.rescan();
+        self.load(rel);
+    }
+}
+
+impl App {
+    fn open_vault(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            match VaultWatcher::new(&path) {
+                Ok(watcher) => {
+                    self.vault = Some(VaultState::open(Vault::open(path), watcher));
+                }
+                Err(e) => eprintln!("watch error: {e}"),
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let now = ui.input(|i| i.time);
+
+        if let Some(vs) = self.vault.as_mut() {
+            if vs.watcher.has_changes() {
+                vs.rescan();
+            }
+            vs.maybe_autosave(now, ui.ctx());
+        }
+
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("mdwriter");
                 ui.separator();
                 if ui.button("Open vault…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.vault_path = Some(path);
-                    }
+                    self.open_vault();
+                }
+                if let Some(vs) = &self.vault {
+                    ui.separator();
+                    ui.label(vs.vault.root().display().to_string());
                 }
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            match &self.vault_path {
-                Some(path) => {
-                    ui.label(format!("Vault: {}", path.display()));
-                }
-                None => {
+        match self.vault.as_mut() {
+            None => {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Откройте vault (папку с .md файлами), чтобы начать.");
+                        if ui.button("Open vault…").clicked() {
+                            self.open_vault();
+                        }
                     });
-                }
+                });
             }
-        });
+            Some(vs) => {
+                egui::Panel::left("tree")
+                    .resizable(true)
+                    .default_size(240.0)
+                    .min_size(150.0)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let name_edit = egui::TextEdit::singleline(&mut vs.new_note_name)
+                                .hint_text("note.md")
+                                .desired_width(120.0);
+                            let resp = ui.add(name_edit);
+                            let enter = resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button("+").on_hover_text("Новая заметка").clicked()
+                                || enter
+                            {
+                                vs.create_note();
+                            }
+                        });
+                        ui.separator();
+
+                        let selected = vs.open.clone();
+                        let clicked = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| tree::show_tree(ui, &vs.tree, &selected))
+                            .inner;
+                        if let Some(rel) = clicked {
+                            vs.load(rel);
+                        }
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    if vs.open.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.strong(
+                                vs.open
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default(),
+                            );
+                            if vs.dirty {
+                                ui.label("●");
+                            }
+                        });
+                        ui.separator();
+
+                        let resp = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                egui::TextEdit::multiline(&mut vs.editor_text)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .show(ui)
+                            })
+                            .inner;
+                        if resp.response.changed() {
+                            vs.dirty = true;
+                            vs.last_edit = Some(now);
+                        }
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Выберите заметку слева или создайте новую.");
+                        });
+                    }
+                });
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app"]
+members = ["crates/app", "crates/vault"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,6 @@ eframe = { version = "0.37", default-features = false, features = [
 egui = "0.37"
 egui_extras = "0.37"
 rfd = "0.17"
+walkdir = "2.5"
+notify = "8"
+thiserror = "2"
