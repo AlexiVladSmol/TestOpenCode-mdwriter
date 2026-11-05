@@ -175,6 +175,8 @@ struct VaultState {
     last_edit: Option<f64>,
     new_note_name: String,
     view_mode: ViewMode,
+    /// Доля ширины предпросмотра в режиме Split (0..1).
+    preview_frac: f32,
     show_graph: bool,
     search_query: String,
     quick_open: Option<QuickOpen>,
@@ -195,6 +197,7 @@ impl VaultState {
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
+            preview_frac: 0.5,
             show_graph: false,
             search_query: String::new(),
             quick_open: None,
@@ -455,6 +458,106 @@ impl VaultState {
         self.editor_text.replace_range(lr, &new_block);
         self.dirty = true;
         self.last_edit = None;
+    }
+
+    // ------------------------- Центральная область -------------------------
+
+    /// Отрисовка редактора.
+    fn ui_editor(&mut self, ui: &mut egui::Ui, now: f64) {
+        if self.open.is_some() {
+            ui.horizontal(|ui| {
+                ui.strong(
+                    self.open
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                );
+                if self.dirty {
+                    ui.label("●");
+                }
+            });
+            ui.separator();
+
+            let theme =
+                egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
+            let mut layouter =
+                |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                    let mut job = egui_extras::syntax_highlighting::highlight(
+                        ui.ctx(),
+                        ui.style(),
+                        &theme,
+                        buf.as_str(),
+                        "md",
+                    );
+                    job.wrap.max_width = wrap_width;
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+
+            let n_lines = self.editor_text.lines().count();
+            let digits = n_lines.to_string().len().max(2);
+            let mut edit = egui::TextEdit::multiline(&mut self.editor_text)
+                .code_editor()
+                .id(editor_id())
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::symmetric(4, 0))
+                .desired_width(f32::INFINITY)
+                .layouter(&mut layouter);
+            if self.quick_open.is_some() {
+                edit = edit.interactive(false);
+            }
+
+            let output = egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        // Нумерация строк: отдельный gutter слева от редактора.
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for i in 1..=n_lines {
+                                ui.monospace(format!("{i:>digits$} "));
+                            }
+                        });
+                        edit.show(ui)
+                    })
+                    .inner
+                })
+                .inner;
+
+            if output.response.changed() {
+                self.dirty = true;
+                self.last_edit = Some(now);
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Выберите заметку слева или создайте новую.");
+            });
+        }
+    }
+
+    /// Отрисовка предпросмотра.
+    fn ui_preview(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.strong("Preview");
+        ui.separator();
+        let actions = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                preview::markdown(ui, &self.editor_text)
+            })
+            .inner;
+        for action in actions {
+            match action {
+                preview::Action::OpenWiki(_) => {
+                    if let Some(rel) = self.open_wiki(&action) {
+                        self.load(rel);
+                    }
+                }
+                preview::Action::ToggleTask { line_in_body } => {
+                    self.toggle_task(line_in_body);
+                }
+            }
+        }
     }
 }
 
@@ -843,9 +946,8 @@ impl eframe::App for App {
             }
             Some(vs) => {
                 let tree_clicked = egui::Panel::left("tree")
-                    .resizable(true)
+                    .resizable(false)
                     .default_size(240.0)
-                    .min_size(150.0)
                     .show(ui, |ui| {
                         let mut clicked: Option<PathBuf> = None;
 
@@ -946,113 +1048,72 @@ impl eframe::App for App {
                     vs.load(rel);
                 }
 
-                if vs.view_mode != ViewMode::Edit {
-                    let actions = egui::Panel::right("preview")
-                        .resizable(true)
-                        .default_size(560.0)
-                        .min_size(250.0)
-                        .show(ui, |ui| {
-                            ui.add_space(4.0);
-                            ui.strong("Preview");
-                            ui.separator();
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.add_space(6.0);
-                                    preview::markdown(ui, &vs.editor_text)
-                                })
-                                .inner
-                        })
-                        .inner;
-                    for action in actions {
-                        match action {
-                            preview::Action::OpenWiki(_) => {
-                                if let Some(rel) = vs.open_wiki(&action) {
-                                    vs.load(rel);
+                egui::CentralPanel::default().show(ui, |ui| {
+                    match vs.view_mode {
+                        ViewMode::Edit => vs.ui_editor(ui, now),
+                        ViewMode::Preview => vs.ui_preview(ui),
+                        ViewMode::Split => {
+                            let full = ui.available_rect_before_wrap();
+                            if full.width() < 620.0 {
+                                // Слишком узко для сплита — только редактор.
+                                vs.ui_editor(ui, now);
+                            } else {
+                                const DIVIDER_W: f32 = 6.0;
+                                let preview_w = (full.width() * vs.preview_frac)
+                                    .clamp(240.0, full.width() - 340.0);
+                                let divider_x = full.max.x - preview_w;
+                                let editor_rect = egui::Rect::from_min_max(
+                                    full.min,
+                                    egui::pos2(divider_x, full.max.y),
+                                );
+                                let divider_rect = egui::Rect::from_min_max(
+                                    egui::pos2(divider_x, full.min.y),
+                                    egui::pos2(divider_x + DIVIDER_W, full.max.y),
+                                );
+                                let preview_rect = egui::Rect::from_min_max(
+                                    egui::pos2(divider_x + DIVIDER_W, full.min.y),
+                                    full.max,
+                                );
+
+                                let mut editor_ui = ui
+                                    .new_child(egui::UiBuilder::new().max_rect(editor_rect));
+                                vs.ui_editor(&mut editor_ui, now);
+
+                                let mut preview_ui = ui
+                                    .new_child(egui::UiBuilder::new().max_rect(preview_rect));
+                                vs.ui_preview(&mut preview_ui);
+
+                                // Разделитель: ширина меняется на дельту перетаскивания,
+                                // поэтому случайный клик сдвигает его на пару пикселей,
+                                // а не «складывает» панели (в отличие от системных панелей).
+                                let resp = ui.interact(
+                                    divider_rect,
+                                    egui::Id::unique("split_divider"),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                if resp.dragged_by(egui::PointerButton::Primary) {
+                                    let delta = resp.drag_delta().x;
+                                    vs.preview_frac = (vs.preview_frac
+                                        - delta / full.width())
+                                        .clamp(0.2, 0.85);
+                                }
+                                let color = if resp.dragged() || resp.hovered() {
+                                    ui.visuals().widgets.hovered.bg_stroke.color
+                                } else {
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color
+                                };
+                                ui.painter().rect_filled(
+                                    divider_rect.shrink2(egui::vec2(2.0, 0.0)),
+                                    1.0,
+                                    color,
+                                );
+                                if resp.hovered() {
+                                    ui.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                                 }
                             }
-                            preview::Action::ToggleTask { line_in_body } => {
-                                vs.toggle_task(line_in_body);
-                            }
                         }
-                    }
-                }
-
-                if vs.view_mode != ViewMode::Preview {
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        if vs.open.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.strong(
-                                vs.open
-                                    .as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_default(),
-                            );
-                            if vs.dirty {
-                                ui.label("●");
-                            }
-                        });
-                        ui.separator();
-
-                        let theme =
-                            egui_extras::syntax_highlighting::CodeTheme::from_memory(
-                                ui.ctx(),
-                                ui.style(),
-                            );
-                        let mut layouter =
-                            |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                                let mut job = egui_extras::syntax_highlighting::highlight(
-                                    ui.ctx(),
-                                    ui.style(),
-                                    &theme,
-                                    buf.as_str(),
-                                    "md",
-                                );
-                                job.wrap.max_width = wrap_width;
-                                ui.fonts_mut(|f| f.layout_job(job))
-                            };
-
-                        let n_lines = vs.editor_text.lines().count();
-                        let digits = n_lines.to_string().len().max(2);
-                        let mut edit = egui::TextEdit::multiline(&mut vs.editor_text)
-                            .code_editor()
-                            .id(editor_id())
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::symmetric(4, 0))
-                            .desired_width(f32::INFINITY)
-                            .layouter(&mut layouter);
-                        if vs.quick_open.is_some() {
-                            edit = edit.interactive(false);
-                        }
-
-                        let output = egui::ScrollArea::both()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.horizontal_top(|ui| {
-                                    // Нумерация строк: отдельный gutter слева от редактора.
-                                    ui.vertical(|ui| {
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        for i in 1..=n_lines {
-                                            ui.monospace(format!("{i:>digits$} "));
-                                        }
-                                    });
-                                    edit.show(ui)
-                                })
-                                .inner
-                            })
-                            .inner;
-
-                        if output.response.changed() {
-                            vs.dirty = true;
-                            vs.last_edit = Some(now);
-                        }
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label("Выберите заметку слева или создайте новую.");
-                        });
                     }
                 });
-                }
 
                 // Граф связей.
                 if vs.show_graph {
