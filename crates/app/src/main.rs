@@ -63,6 +63,12 @@ struct Settings {
     last_vault: Option<PathBuf>,
     #[serde(default)]
     window_size: Option<[f32; 2]>,
+    #[serde(default = "default_tree_w")]
+    tree_w: f32,
+}
+
+fn default_tree_w() -> f32 {
+    240.0
 }
 
 impl Default for Settings {
@@ -73,6 +79,7 @@ impl Default for Settings {
             show_graph: false,
             last_vault: None,
             window_size: None,
+            tree_w: 240.0,
         }
     }
 }
@@ -177,6 +184,8 @@ struct VaultState {
     view_mode: ViewMode,
     /// Доля ширины предпросмотра в режиме Split (0..1).
     preview_frac: f32,
+    /// Ширина панели дерева, px.
+    tree_w: f32,
     show_graph: bool,
     search_query: String,
     quick_open: Option<QuickOpen>,
@@ -198,6 +207,7 @@ impl VaultState {
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
             preview_frac: 0.5,
+            tree_w: 240.0,
             show_graph: false,
             search_query: String::new(),
             quick_open: None,
@@ -598,6 +608,7 @@ impl App {
                     let mut vs = VaultState::open(Vault::open(path), watcher);
                     vs.view_mode = app.settings.view_mode;
                     vs.show_graph = app.settings.show_graph;
+                    vs.tree_w = app.settings.tree_w;
                     app.vault = Some(vs);
                 }
             }
@@ -613,6 +624,7 @@ impl App {
                     let mut vs = VaultState::open(Vault::open(path.clone()), watcher);
                     vs.view_mode = self.settings.view_mode;
                     vs.show_graph = self.settings.show_graph;
+                    vs.tree_w = self.settings.tree_w;
                     self.vault = Some(vs);
                     self.settings.last_vault = Some(path);
                     self.settings_dirty = true;
@@ -637,6 +649,10 @@ impl App {
             }
             if vs.show_graph != self.settings.show_graph {
                 self.settings.show_graph = vs.show_graph;
+                self.settings_dirty = true;
+            }
+            if vs.tree_w != self.settings.tree_w {
+                self.settings.tree_w = vs.tree_w;
                 self.settings_dirty = true;
             }
         }
@@ -951,13 +967,13 @@ impl eframe::App for App {
         let sep_stroke =
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
         ui.painter().hline(full.x_range(), top_h, sep_stroke);
-        const TREE_W: f32 = 240.0;
+        let tree_w = self.vault.as_ref().map(|v| v.tree_w).unwrap_or(240.0);
         let tree_rect = egui::Rect::from_min_max(
             egui::pos2(full.min.x, top_h),
-            egui::pos2(full.min.x + TREE_W, full.max.y),
+            egui::pos2(full.min.x + tree_w, full.max.y),
         );
         let main_rect = egui::Rect::from_min_max(
-            egui::pos2(full.min.x + TREE_W, top_h),
+            egui::pos2(full.min.x + tree_w, top_h),
             full.max,
         );
         ui.painter().vline(tree_rect.max.x, tree_rect.y_range(), sep_stroke);
@@ -965,6 +981,7 @@ impl eframe::App for App {
         match self.vault.as_mut() {
             None => {
                 let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                main_ui.shrink_clip_rect(main_rect);
                 main_ui.centered_and_justified(|ui| {
                     if ui.button("Open vault…").clicked() {
                         self.open_vault();
@@ -974,6 +991,7 @@ impl eframe::App for App {
             Some(vs) => {
                 // Дерево заметок.
                 let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(tree_rect));
+                tree_ui.shrink_clip_rect(tree_rect);
                 let tree_clicked = {
                     let ui = &mut tree_ui;
                     let mut clicked: Option<PathBuf> = None;
@@ -1068,6 +1086,7 @@ impl eframe::App for App {
 
                 // Основная область: редактор / предпросмотр / сплит.
                 let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                main_ui.shrink_clip_rect(main_rect);
                 match vs.view_mode {
                     ViewMode::Edit => vs.ui_editor(&mut main_ui, now),
                     ViewMode::Preview => vs.ui_preview(&mut main_ui),
@@ -1096,10 +1115,12 @@ impl eframe::App for App {
 
                             let mut editor_ui = main_ui
                                 .new_child(egui::UiBuilder::new().max_rect(editor_rect));
+                            editor_ui.shrink_clip_rect(editor_rect);
                             vs.ui_editor(&mut editor_ui, now);
 
                             let mut preview_ui = main_ui
                                 .new_child(egui::UiBuilder::new().max_rect(preview_rect));
+                            preview_ui.shrink_clip_rect(preview_rect);
                             vs.ui_preview(&mut preview_ui);
 
                             // Разделитель: ширина меняется на дельту перетаскивания,
@@ -1129,6 +1150,27 @@ impl eframe::App for App {
                                 main_ui.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                             }
                         }
+                    }
+                }
+
+                // Разделитель дерева: перетаскивание меняет ширину на дельту
+                // (случайный клик сдвинет его на пару пикселей).
+                {
+                    let strip = egui::Rect::from_min_max(
+                        egui::pos2(tree_rect.max.x - 3.0, tree_rect.min.y),
+                        egui::pos2(tree_rect.max.x + 3.0, tree_rect.max.y),
+                    );
+                    let resp = ui.interact(
+                        strip,
+                        egui::Id::unique("tree_divider"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if resp.dragged_by(egui::PointerButton::Primary) {
+                        let delta = resp.drag_delta().x;
+                        vs.tree_w = (vs.tree_w + delta).clamp(160.0, 640.0);
+                    }
+                    if resp.hovered() || resp.dragged() {
+                        ui.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
                 }
 
