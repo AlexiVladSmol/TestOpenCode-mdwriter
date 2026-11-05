@@ -16,7 +16,7 @@ eframe = { version = "0.37", default-features = false, features = [
     "wayland",
 ] }
 egui = "0.37"
-egui_extras = "0.37"
+egui_extras = { version = "0.37", features = ["syntect"] }
 rfd = "0.17"
 walkdir = "2.5"
 notify = "8"

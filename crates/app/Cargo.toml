@@ -8,5 +8,6 @@ repository.workspace = true
 [dependencies]
 eframe.workspace = true
 egui.workspace = true
+egui_extras.workspace = true
 rfd.workspace = true
 vault = { path = "../vault" }

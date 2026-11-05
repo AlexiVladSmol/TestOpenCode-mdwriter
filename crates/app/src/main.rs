@@ -234,16 +234,49 @@ impl eframe::App for App {
                         });
                         ui.separator();
 
-                        let resp = egui::ScrollArea::vertical()
+                        let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(
+                            ui.ctx(),
+                            ui.style(),
+                        );
+                        let mut layouter =
+                            |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                let mut job = egui_extras::syntax_highlighting::highlight(
+                                    ui.ctx(),
+                                    ui.style(),
+                                    &theme,
+                                    buf.as_str(),
+                                    "md",
+                                );
+                                job.wrap.max_width = wrap_width;
+                                ui.fonts_mut(|f| f.layout_job(job))
+                            };
+
+                        let output = egui::ScrollArea::both()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                egui::TextEdit::multiline(&mut vs.editor_text)
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY)
-                                    .show(ui)
+                                ui.horizontal_top(|ui| {
+                                    // Нумерация строк: отдельный gutter слева от редактора.
+                                    let n_lines = vs.editor_text.lines().count();
+                                    let digits = n_lines.to_string().len().max(2);
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        for i in 1..=n_lines {
+                                            ui.monospace(format!("{i:>digits$} "));
+                                        }
+                                    });
+                                    egui::TextEdit::multiline(&mut vs.editor_text)
+                                        .code_editor()
+                                        .frame(egui::Frame::NONE)
+                                        .margin(egui::Margin::symmetric(4, 0))
+                                        .desired_width(f32::INFINITY)
+                                        .layouter(&mut layouter)
+                                        .show(ui)
+                                })
+                                .inner
                             })
                             .inner;
-                        if resp.response.changed() {
+
+                        if output.response.changed() {
                             vs.dirty = true;
                             vs.last_edit = Some(now);
                         }
