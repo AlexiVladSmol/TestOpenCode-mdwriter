@@ -1,0 +1,59 @@
+# --- Секреты ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json
+
+# --- ОС ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Редакторы / IDE ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Node.js ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+dist/
+build/
+coverage/
+.npm/
+.yarn/cache
+.yarn/install-state.gz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Go / Rust / Java ---
+bin/
+target/
+*.class
+.gradle/
+build/
+
+# --- Прочее ---
+*.log
+*.tmp
+.cache/
+tmp/
