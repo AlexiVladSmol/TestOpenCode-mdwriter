@@ -258,7 +258,7 @@ fn render_heading(
     };
     ui.add_space(size * 0.4);
     let fmt = TextFormat {
-        font_id: FontId::proportional(size),
+        font_id: bold_font_id(size),
         color: ui.visuals().strong_text_color(),
         ..Default::default()
     };
@@ -626,6 +626,12 @@ fn body_size(ui: &Ui) -> f32 {
         .unwrap_or(14.0)
 }
 
+/// Жирный шрифт: системный bold, зарегистрированный приложением под именем
+/// `mdwriter-bold`. Если не найден, egui откатится на обычный.
+fn bold_font_id(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name("mdwriter-bold".into()))
+}
+
 fn render_inline(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
@@ -700,6 +706,7 @@ fn collect_inline(
                 events.next();
                 let mut f = stack.last().unwrap().clone();
                 f.color = ui.visuals().strong_text_color();
+                f.font_id = bold_font_id(f.font_id.size);
                 stack.push(f);
             }
             Event::Start(Tag::Emphasis) => {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use graph::GraphView;
 use index::Index;
@@ -13,10 +14,131 @@ use vault::{Vault, VaultWatcher};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
 
+/// Фиксированный id редактора — для доступа к состоянию TextEdit (курсор/выделение).
+const EDITOR_ID_SRC: &str = "mdwriter_editor";
+
+fn editor_id() -> egui::Id {
+    egui::Id::unique(EDITOR_ID_SRC)
+}
+
+/// Режим отображения: только редактор / сплит / только предпросмотр.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Default)]
+enum ViewMode {
+    Edit,
+    #[default]
+    Split,
+    Preview,
+}
+
+
+impl ViewMode {
+    fn next(self) -> Self {
+        match self {
+            ViewMode::Edit => ViewMode::Split,
+            ViewMode::Split => ViewMode::Preview,
+            ViewMode::Preview => ViewMode::Edit,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ViewMode::Edit => "Edit",
+            ViewMode::Split => "Split",
+            ViewMode::Preview => "Preview",
+        }
+    }
+}
+
+/// Настройки приложения (persist в JSON).
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    #[serde(default)]
+    dark: Option<bool>,
+    #[serde(default)]
+    view_mode: ViewMode,
+    #[serde(default)]
+    show_graph: bool,
+    #[serde(default)]
+    last_vault: Option<PathBuf>,
+    #[serde(default)]
+    window_size: Option<[f32; 2]>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            dark: None,
+            view_mode: ViewMode::Split,
+            show_graph: false,
+            last_vault: None,
+            window_size: None,
+        }
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("mdwriter").join("settings.json"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+        base.map(|p| p.join("mdwriter").join("settings.json"))
+    }
+}
+
+fn load_settings() -> Settings {
+    let Some(path) = settings_path() else {
+        return Settings::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("settings parse failed ({e}); используем значения по умолчанию");
+            Settings::default()
+        }),
+        Err(_) => Settings::default(),
+    }
+}
+
+/// Пытается найти жирный системный шрифт (Windows/Linux).
+fn load_bold_font() -> Option<egui::FontData> {
+    const CANDIDATES: &[&str] = &[
+        // Windows
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\verdanab.ttf",
+        "C:\\Windows\\Fonts\\tahomabd.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ];
+    for p in CANDIDATES {
+        if let Ok(bytes) = std::fs::read(p) {
+            return Some(egui::FontData::from_owned(bytes));
+        }
+    }
+    None
+}
+
 fn main() -> eframe::Result {
+    let settings = load_settings();
+    let window_size = settings
+        .window_size
+        .map(|[w, h]| egui::vec2(w.max(600.0), h.max(400.0)))
+        .unwrap_or_else(|| egui::vec2(1100.0, 720.0));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size(window_size)
             .with_min_inner_size([700.0, 450.0])
             .with_title("mdwriter"),
         ..Default::default()
@@ -25,13 +147,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "mdwriter",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
 }
 
-#[derive(Default)]
 struct App {
     vault: Option<VaultState>,
+    settings: Settings,
+    settings_dirty: bool,
 }
 
 /// Состояние быстрого переключателя (Ctrl+O).
@@ -51,7 +174,7 @@ struct VaultState {
     dirty: bool,
     last_edit: Option<f64>,
     new_note_name: String,
-    show_preview: bool,
+    view_mode: ViewMode,
     show_graph: bool,
     search_query: String,
     quick_open: Option<QuickOpen>,
@@ -71,7 +194,7 @@ impl VaultState {
             dirty: false,
             last_edit: None,
             new_note_name: String::new(),
-            show_preview: true,
+            view_mode: ViewMode::Split,
             show_graph: false,
             search_query: String::new(),
             quick_open: None,
@@ -228,20 +351,222 @@ impl VaultState {
             }
         }
     }
+
+    // ------------------------- Форматирование -------------------------
+
+    /// Текущее выделение в редакторе (символьный диапазон), если доступно.
+    fn selected_char_range(&self, ctx: &egui::Context) -> Option<std::ops::Range<usize>> {
+        let state = egui::TextEdit::load_state(ctx, editor_id())?;
+        let range = state.cursor.char_range()?.as_sorted_char_range();
+        Some(range.start.0..range.end.0)
+    }
+
+    fn char_to_byte(&self, char_idx: usize) -> usize {
+        self.editor_text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.editor_text.len())
+    }
+
+    fn set_cursor(&mut self, ctx: &egui::Context, char_idx: usize) {
+        if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id()) {
+            state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(
+                egui::text::CCursor::new(char_idx),
+            )));
+            egui::TextEdit::store_state(ctx, editor_id(), state);
+        }
+    }
+
+    /// Заворачивает выделение между `before` и `after` (снимает, если уже обёрнуто).
+    fn wrap_selection(&mut self, ctx: &egui::Context, before: &str, after: &str) {
+        let Some(range) = self.selected_char_range(ctx) else {
+            return;
+        };
+        let start = self.char_to_byte(range.start);
+        let end = self.char_to_byte(range.end);
+        let sel = self.editor_text[start..end].to_string();
+
+        if !sel.is_empty() && sel.starts_with(before) && sel.ends_with(after) {
+            // Снять форматирование.
+            let inner = &sel[before.len()..sel.len() - after.len()];
+            self.editor_text.replace_range(start..end, inner);
+            let cursor = self.editor_text[..start].chars().count() + inner.chars().count();
+            self.set_cursor(ctx, cursor);
+        } else {
+            let new = format!("{before}{sel}{after}");
+            self.editor_text.replace_range(start..end, &new);
+            let cursor = self.editor_text[..start].chars().count() + new.chars().count();
+            self.set_cursor(ctx, cursor);
+        }
+        self.dirty = true;
+        self.last_edit = None;
+    }
+
+    /// Вставляет ссылку: выделение → `[текст]()`, курсор внутри скобок.
+    fn fmt_link(&mut self, ctx: &egui::Context) {
+        let Some(range) = self.selected_char_range(ctx) else {
+            return;
+        };
+        let start = self.char_to_byte(range.start);
+        let end = self.char_to_byte(range.end);
+        let sel = self.editor_text[start..end].to_string();
+        if sel.starts_with('[') && sel.ends_with(')') {
+            return; // уже похоже на ссылку — не трогаем
+        }
+        let new = format!("[{sel}]()");
+        self.editor_text.replace_range(start..end, &new);
+        let cursor = self.editor_text[..start].chars().count() + sel.chars().count() + 3;
+        self.set_cursor(ctx, cursor);
+        self.dirty = true;
+        self.last_edit = None;
+    }
+
+    /// Диапазон строк, покрывающих выделение [start, end).
+    fn lines_range(&self, start: usize, end: usize) -> std::ops::Range<usize> {
+        let ls = self.editor_text[..start]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let le = if end > start {
+            self.editor_text[end - 1..]
+                .find('\n')
+                .map(|p| end - 1 + p)
+                .unwrap_or(self.editor_text.len())
+        } else {
+            self.editor_text[end..]
+                .find('\n')
+                .map(|p| end + p)
+                .unwrap_or(self.editor_text.len())
+        };
+        ls..le
+    }
+
+    /// Применяет построчное преобразование к строкам выделения.
+    fn fmt_lines(&mut self, ctx: &egui::Context, f: fn(&str) -> String) {
+        let Some(range) = self.selected_char_range(ctx) else {
+            return;
+        };
+        let start = self.char_to_byte(range.start);
+        let end = self.char_to_byte(range.end);
+        let lr = self.lines_range(start, end);
+        let block = self.editor_text[lr.clone()].to_string();
+        let new_block = block.split('\n').map(f).collect::<Vec<_>>().join("\n");
+        self.editor_text.replace_range(lr, &new_block);
+        self.dirty = true;
+        self.last_edit = None;
+    }
 }
 
 impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Регистрируем жирный системный шрифт (если найден).
+        if let Some(bold) = load_bold_font() {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("mdwriter-bold".to_string(), std::sync::Arc::new(bold));
+            fonts.families.insert(
+                egui::FontFamily::Name("mdwriter-bold".into()),
+                vec!["mdwriter-bold".to_string()],
+            );
+            cc.egui_ctx.set_fonts(fonts);
+        }
+
+        let settings = load_settings();
+        if let Some(dark) = settings.dark {
+            cc.egui_ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+        }
+
+        let mut app = App {
+            vault: None,
+            settings,
+            settings_dirty: false,
+        };
+
+        // Восстанавливаем последний vault.
+        if let Some(path) = app.settings.last_vault.clone() {
+            if path.is_dir() {
+                if let Ok(watcher) = VaultWatcher::new(&path) {
+                    let mut vs = VaultState::open(Vault::open(path), watcher);
+                    vs.view_mode = app.settings.view_mode;
+                    vs.show_graph = app.settings.show_graph;
+                    app.vault = Some(vs);
+                }
+            }
+        }
+
+        app
+    }
+
     fn open_vault(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             match VaultWatcher::new(&path) {
                 Ok(watcher) => {
-                    self.vault = Some(VaultState::open(Vault::open(path), watcher));
+                    let mut vs = VaultState::open(Vault::open(path.clone()), watcher);
+                    vs.view_mode = self.settings.view_mode;
+                    vs.show_graph = self.settings.show_graph;
+                    self.vault = Some(vs);
+                    self.settings.last_vault = Some(path);
+                    self.settings_dirty = true;
                 }
                 Err(e) => eprintln!("watch error: {e}"),
             }
         }
     }
 
+    /// Синхронизирует UI-состояние в настройки и сохраняет при изменениях.
+    fn sync_settings(&mut self, ctx: &egui::Context) {
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self.settings.dark != Some(dark) {
+            self.settings.dark = Some(dark);
+            self.settings_dirty = true;
+        }
+
+        if let Some(vs) = &self.vault {
+            if vs.view_mode != self.settings.view_mode {
+                self.settings.view_mode = vs.view_mode;
+                self.settings_dirty = true;
+            }
+            if vs.show_graph != self.settings.show_graph {
+                self.settings.show_graph = vs.show_graph;
+                self.settings_dirty = true;
+            }
+        }
+
+        // Размер окна сохраняем всегда (но без флага dirty — пишем при выходе).
+        if let Some(size) = ctx.input(|i| i.viewport().inner_rect).map(|r| [r.width(), r.height()])
+        {
+            self.settings.window_size = Some(size);
+        }
+
+        if self.settings_dirty {
+            self.save_settings();
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = settings_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_string_pretty(&self.settings) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&path, s) {
+                    eprintln!("settings save failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("settings serialize failed: {e}"),
+        }
+        self.settings_dirty = false;
+    }
+}
+
+impl App {
     /// Создаёт/открывает ежедневную заметку `ГГГГ-ММ-ДД.md` в корне vault.
     fn open_today(&mut self) {
         let Some(vs) = self.vault.as_mut() else {
@@ -333,9 +658,49 @@ fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+// ---------- Построчные преобразования для панели форматирования ----------
+
+/// Заголовок уровня `level` (переключается: повторное применение снимает).
+fn fmt_heading(line: &str, level: usize) -> String {
+    let body = line.trim_start_matches('#').trim_start_matches(' ');
+    let prefix = format!("{} ", "#".repeat(level));
+    if body.is_empty() {
+        "#".repeat(level)
+    } else if line.starts_with(&prefix) {
+        body.to_string()
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
+fn fmt_list(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("- ") {
+        rest.to_string()
+    } else {
+        format!("- {line}")
+    }
+}
+
+fn fmt_task(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("- [ ] ") {
+        format!("- [x] {rest}")
+    } else if let Some(rest) = line.strip_prefix("- [x] ") {
+        format!("- [ ] {rest}")
+    } else {
+        format!("- [ ] {line}")
+    }
+}
+
+fn fmt_quote(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("> ") {
+        rest.to_string()
+    } else {
+        format!("> {line}")
+    }
+}
+
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let now = ui.input(|i| i.time);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {        let now = ui.input(|i| i.time);
 
         // Глобальные шорткаты (читаем до того, как виджеты успеют поглотить события).
         let ctrl_o = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
@@ -375,7 +740,14 @@ impl eframe::App for App {
                 let mut export_html = false;
                 if let Some(vs) = self.vault.as_mut() {
                     ui.separator();
-                    ui.toggle_value(&mut vs.show_preview, "Preview");
+                    let mode = vs.view_mode;
+                    if ui
+                        .button(format!("View: {}", mode.label()))
+                        .on_hover_text("Режим: Edit → Split → Preview")
+                        .clicked()
+                    {
+                        vs.view_mode = mode.next();
+                    }
                     ui.toggle_value(&mut vs.show_graph, "Graph");
                     ui.separator();
                     if ui
@@ -407,6 +779,56 @@ impl eframe::App for App {
                     self.export_html();
                 }
             });
+
+            // Панель форматирования текста.
+            if let Some(vs) = self.vault.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(vs.open.is_some(), |ui| {
+                        if ui.small_button("B").on_hover_text("Жирный").clicked() {
+                            vs.wrap_selection(ui.ctx(), "**", "**");
+                        }
+                        if ui.small_button("I").on_hover_text("Курсив").clicked() {
+                            vs.wrap_selection(ui.ctx(), "*", "*");
+                        }
+                        if ui.small_button("S").on_hover_text("Зачёркнутый").clicked() {
+                            vs.wrap_selection(ui.ctx(), "~~", "~~");
+                        }
+                        if ui.small_button("`").on_hover_text("Инлайн-код").clicked() {
+                            vs.wrap_selection(ui.ctx(), "`", "`");
+                        }
+                        ui.separator();
+                        if ui.small_button("H1").clicked() {
+                            vs.fmt_lines(ui.ctx(), |l| fmt_heading(l, 1));
+                        }
+                        if ui.small_button("H2").clicked() {
+                            vs.fmt_lines(ui.ctx(), |l| fmt_heading(l, 2));
+                        }
+                        if ui.small_button("H3").clicked() {
+                            vs.fmt_lines(ui.ctx(), |l| fmt_heading(l, 3));
+                        }
+                        ui.separator();
+                        if ui.small_button("•").on_hover_text("Список").clicked() {
+                            vs.fmt_lines(ui.ctx(), fmt_list);
+                        }
+                        if ui.small_button("☑").on_hover_text("Задача").clicked() {
+                            vs.fmt_lines(ui.ctx(), fmt_task);
+                        }
+                        if ui.small_button("❝").on_hover_text("Цитата").clicked() {
+                            vs.fmt_lines(ui.ctx(), fmt_quote);
+                        }
+                        ui.separator();
+                        if ui.small_button("code").on_hover_text("Блок кода").clicked() {
+                            vs.wrap_selection(ui.ctx(), "```\n", "\n```");
+                        }
+                        if ui.small_button("link").on_hover_text("Ссылка").clicked() {
+                            vs.fmt_link(ui.ctx());
+                        }
+                        if ui.small_button("—").on_hover_text("Горизонтальная линия").clicked() {
+                            vs.wrap_selection(ui.ctx(), "\n---\n", "");
+                        }
+                    });
+                });
+            }
         });
 
         match self.vault.as_mut() {
@@ -524,7 +946,7 @@ impl eframe::App for App {
                     vs.load(rel);
                 }
 
-                if vs.show_preview {
+                if vs.view_mode != ViewMode::Edit {
                     let actions = egui::Panel::right("preview")
                         .resizable(true)
                         .default_size(560.0)
@@ -556,8 +978,9 @@ impl eframe::App for App {
                     }
                 }
 
-                egui::CentralPanel::default().show(ui, |ui| {
-                    if vs.open.is_some() {
+                if vs.view_mode != ViewMode::Preview {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        if vs.open.is_some() {
                         ui.horizontal(|ui| {
                             ui.strong(
                                 vs.open
@@ -593,6 +1016,7 @@ impl eframe::App for App {
                         let digits = n_lines.to_string().len().max(2);
                         let mut edit = egui::TextEdit::multiline(&mut vs.editor_text)
                             .code_editor()
+                            .id(editor_id())
                             .frame(egui::Frame::NONE)
                             .margin(egui::Margin::symmetric(4, 0))
                             .desired_width(f32::INFINITY)
@@ -628,6 +1052,7 @@ impl eframe::App for App {
                         });
                     }
                 });
+                }
 
                 // Граф связей.
                 if vs.show_graph {
@@ -824,5 +1249,11 @@ impl eframe::App for App {
                 }
             }
         }
+
+        self.sync_settings(ui.ctx());
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_settings();
     }
 }
