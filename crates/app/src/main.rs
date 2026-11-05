@@ -803,7 +803,8 @@ fn fmt_quote(line: &str) -> String {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {        let now = ui.input(|i| i.time);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let now = ui.input(|i| i.time);
 
         // Глобальные шорткаты (читаем до того, как виджеты успеют поглотить события).
         let ctrl_o = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
@@ -832,8 +833,18 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal(|ui| {
+        // --- Верхняя панель (собственная раскладка, без egui::Panel — в 0.37
+        // панели накапливают margin в хранимом размере, из-за чего «уезжают») ---
+        let full = ui.available_rect_before_wrap();
+        let top_h;
+        {
+            let mut top_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(full)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            top_ui.add_space(4.0);
+            top_ui.horizontal(|ui| {
                 ui.heading("mdwriter");
                 ui.separator();
                 if ui.button("Open vault…").clicked() {
@@ -885,7 +896,7 @@ impl eframe::App for App {
 
             // Панель форматирования текста.
             if let Some(vs) = self.vault.as_mut() {
-                ui.horizontal(|ui| {
+                top_ui.horizontal(|ui| {
                     ui.add_enabled_ui(vs.open.is_some(), |ui| {
                         if ui.small_button("B").on_hover_text("Жирный").clicked() {
                             vs.wrap_selection(ui.ctx(), "**", "**");
@@ -932,188 +943,194 @@ impl eframe::App for App {
                     });
                 });
             }
-        });
+            top_ui.add_space(4.0);
+            top_h = top_ui.min_rect().bottom().max(1.0);
+        }
+
+        // Разделители и области: верх / дерево / основная.
+        let sep_stroke =
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+        ui.painter().hline(full.x_range(), top_h, sep_stroke);
+        const TREE_W: f32 = 240.0;
+        let tree_rect = egui::Rect::from_min_max(
+            egui::pos2(full.min.x, top_h),
+            egui::pos2(full.min.x + TREE_W, full.max.y),
+        );
+        let main_rect = egui::Rect::from_min_max(
+            egui::pos2(full.min.x + TREE_W, top_h),
+            full.max,
+        );
+        ui.painter().vline(tree_rect.max.x, tree_rect.y_range(), sep_stroke);
 
         match self.vault.as_mut() {
             None => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        if ui.button("Open vault…").clicked() {
-                            self.open_vault();
-                        }
-                    });
+                let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                main_ui.centered_and_justified(|ui| {
+                    if ui.button("Open vault…").clicked() {
+                        self.open_vault();
+                    }
                 });
             }
             Some(vs) => {
-                let tree_clicked = egui::Panel::left("tree")
-                    .resizable(false)
-                    .default_size(240.0)
-                    .show(ui, |ui| {
-                        let mut clicked: Option<PathBuf> = None;
+                // Дерево заметок.
+                let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(tree_rect));
+                let tree_clicked = {
+                    let ui = &mut tree_ui;
+                    let mut clicked: Option<PathBuf> = None;
 
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            let name_edit =
-                                egui::TextEdit::singleline(&mut vs.new_note_name)
-                                    .hint_text("note.md")
-                                    .desired_width(110.0);
-                            let resp = ui.add(name_edit);
-                            let enter = resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.button("+").on_hover_text("Новая заметка").clicked()
-                                || enter
-                            {
-                                vs.create_note();
-                            }
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut vs.search_query)
-                                    .hint_text("Поиск…")
-                                    .desired_width(f32::INFINITY),
-                            );
-                            if ui.button("✕").clicked() {
-                                vs.search_query.clear();
-                            }
-                        });
-                        ui.separator();
-
-                        if !vs.search_query.is_empty() {
-                            let results = vs.index.search(&vs.search_query, 30);
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    if results.is_empty() {
-                                        ui.weak("Ничего не найдено");
-                                    }
-                                    for (rel, snippet) in results {
-                                        let title =
-                                            vs.index.title(&rel).unwrap_or("").to_string();
-                                        ui.vertical(|ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    false,
-                                                    egui::RichText::new(&title).strong(),
-                                                )
-                                                .clicked()
-                                            {
-                                                clicked = Some(rel.clone());
-                                            }
-                                            ui.label(
-                                                egui::RichText::new(snippet)
-                                                    .weak()
-                                                    .small(),
-                                            );
-                                        });
-                                    }
-                                });
-                        } else {
-                            let selected = vs.open.clone();
-                            let tree_click = egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| tree::show_tree(ui, &vs.tree, &selected))
-                                .inner;
-                            if let Some(rel) = tree_click {
-                                clicked = Some(rel);
-                            }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let name_edit = egui::TextEdit::singleline(&mut vs.new_note_name)
+                            .hint_text("note.md")
+                            .desired_width(110.0);
+                        let resp = ui.add(name_edit);
+                        let enter = resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("+").on_hover_text("Новая заметка").clicked() || enter {
+                            vs.create_note();
                         }
+                    });
 
-                        ui.separator();
-                        egui::CollapsingHeader::new("Backlinks")
-                            .default_open(true)
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut vs.search_query)
+                                .hint_text("Поиск…")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.button("✕").clicked() {
+                            vs.search_query.clear();
+                        }
+                    });
+                    ui.separator();
+
+                    if !vs.search_query.is_empty() {
+                        let results = vs.index.search(&vs.search_query, 30);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let Some(open) = vs.open.clone() else {
-                                    ui.weak("Откройте заметку");
-                                    return;
-                                };
-                                let backlinks = vs.index.backlinks(&open);
-                                if backlinks.is_empty() {
-                                    ui.weak("Нет обратных ссылок");
+                                if results.is_empty() {
+                                    ui.weak("Ничего не найдено");
                                 }
-                                for rel in backlinks {
+                                for (rel, snippet) in results {
                                     let title =
                                         vs.index.title(&rel).unwrap_or("").to_string();
-                                    let label = format!("{title}  ·  {}", rel.display());
-                                    if ui.selectable_label(false, label).clicked() {
-                                        clicked = Some(rel);
-                                    }
+                                    ui.vertical(|ui| {
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                egui::RichText::new(&title).strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked = Some(rel.clone());
+                                        }
+                                        ui.label(egui::RichText::new(snippet).weak().small());
+                                    });
                                 }
                             });
+                    } else {
+                        let selected = vs.open.clone();
+                        let tree_click = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| tree::show_tree(ui, &vs.tree, &selected))
+                            .inner;
+                        if let Some(rel) = tree_click {
+                            clicked = Some(rel);
+                        }
+                    }
 
-                        clicked
-                    })
-                    .inner;
+                    ui.separator();
+                    egui::CollapsingHeader::new("Backlinks")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let Some(open) = vs.open.clone() else {
+                                ui.weak("Откройте заметку");
+                                return;
+                            };
+                            let backlinks = vs.index.backlinks(&open);
+                            if backlinks.is_empty() {
+                                ui.weak("Нет обратных ссылок");
+                            }
+                            for rel in backlinks {
+                                let title = vs.index.title(&rel).unwrap_or("").to_string();
+                                let label = format!("{title}  ·  {}", rel.display());
+                                if ui.selectable_label(false, label).clicked() {
+                                    clicked = Some(rel);
+                                }
+                            }
+                        });
+
+                    clicked
+                };
                 if let Some(rel) = tree_clicked {
                     vs.load(rel);
                 }
 
-                egui::CentralPanel::default().show(ui, |ui| {
-                    match vs.view_mode {
-                        ViewMode::Edit => vs.ui_editor(ui, now),
-                        ViewMode::Preview => vs.ui_preview(ui),
-                        ViewMode::Split => {
-                            let full = ui.available_rect_before_wrap();
-                            if full.width() < 620.0 {
-                                // Слишком узко для сплита — только редактор.
-                                vs.ui_editor(ui, now);
+                // Основная область: редактор / предпросмотр / сплит.
+                let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                match vs.view_mode {
+                    ViewMode::Edit => vs.ui_editor(&mut main_ui, now),
+                    ViewMode::Preview => vs.ui_preview(&mut main_ui),
+                    ViewMode::Split => {
+                        let full = main_ui.available_rect_before_wrap();
+                        if full.width() < 620.0 {
+                            // Слишком узко для сплита — только редактор.
+                            vs.ui_editor(&mut main_ui, now);
+                        } else {
+                            const DIVIDER_W: f32 = 6.0;
+                            let preview_w = (full.width() * vs.preview_frac)
+                                .clamp(240.0, full.width() - 340.0);
+                            let divider_x = full.max.x - preview_w;
+                            let editor_rect = egui::Rect::from_min_max(
+                                full.min,
+                                egui::pos2(divider_x, full.max.y),
+                            );
+                            let divider_rect = egui::Rect::from_min_max(
+                                egui::pos2(divider_x, full.min.y),
+                                egui::pos2(divider_x + DIVIDER_W, full.max.y),
+                            );
+                            let preview_rect = egui::Rect::from_min_max(
+                                egui::pos2(divider_x + DIVIDER_W, full.min.y),
+                                full.max,
+                            );
+
+                            let mut editor_ui = main_ui
+                                .new_child(egui::UiBuilder::new().max_rect(editor_rect));
+                            vs.ui_editor(&mut editor_ui, now);
+
+                            let mut preview_ui = main_ui
+                                .new_child(egui::UiBuilder::new().max_rect(preview_rect));
+                            vs.ui_preview(&mut preview_ui);
+
+                            // Разделитель: ширина меняется на дельту перетаскивания,
+                            // поэтому случайный клик сдвигает его на пару пикселей,
+                            // а не «складывает» панели.
+                            let resp = main_ui.interact(
+                                divider_rect,
+                                egui::Id::unique("split_divider"),
+                                egui::Sense::click_and_drag(),
+                            );
+                            if resp.dragged_by(egui::PointerButton::Primary) {
+                                let delta = resp.drag_delta().x;
+                                vs.preview_frac =
+                                    (vs.preview_frac - delta / full.width()).clamp(0.2, 0.85);
+                            }
+                            let color = if resp.dragged() || resp.hovered() {
+                                ui.visuals().widgets.hovered.bg_stroke.color
                             } else {
-                                const DIVIDER_W: f32 = 6.0;
-                                let preview_w = (full.width() * vs.preview_frac)
-                                    .clamp(240.0, full.width() - 340.0);
-                                let divider_x = full.max.x - preview_w;
-                                let editor_rect = egui::Rect::from_min_max(
-                                    full.min,
-                                    egui::pos2(divider_x, full.max.y),
-                                );
-                                let divider_rect = egui::Rect::from_min_max(
-                                    egui::pos2(divider_x, full.min.y),
-                                    egui::pos2(divider_x + DIVIDER_W, full.max.y),
-                                );
-                                let preview_rect = egui::Rect::from_min_max(
-                                    egui::pos2(divider_x + DIVIDER_W, full.min.y),
-                                    full.max,
-                                );
-
-                                let mut editor_ui = ui
-                                    .new_child(egui::UiBuilder::new().max_rect(editor_rect));
-                                vs.ui_editor(&mut editor_ui, now);
-
-                                let mut preview_ui = ui
-                                    .new_child(egui::UiBuilder::new().max_rect(preview_rect));
-                                vs.ui_preview(&mut preview_ui);
-
-                                // Разделитель: ширина меняется на дельту перетаскивания,
-                                // поэтому случайный клик сдвигает его на пару пикселей,
-                                // а не «складывает» панели (в отличие от системных панелей).
-                                let resp = ui.interact(
-                                    divider_rect,
-                                    egui::Id::unique("split_divider"),
-                                    egui::Sense::click_and_drag(),
-                                );
-                                if resp.dragged_by(egui::PointerButton::Primary) {
-                                    let delta = resp.drag_delta().x;
-                                    vs.preview_frac = (vs.preview_frac
-                                        - delta / full.width())
-                                        .clamp(0.2, 0.85);
-                                }
-                                let color = if resp.dragged() || resp.hovered() {
-                                    ui.visuals().widgets.hovered.bg_stroke.color
-                                } else {
-                                    ui.visuals().widgets.noninteractive.bg_stroke.color
-                                };
-                                ui.painter().rect_filled(
-                                    divider_rect.shrink2(egui::vec2(2.0, 0.0)),
-                                    1.0,
-                                    color,
-                                );
-                                if resp.hovered() {
-                                    ui.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                                }
+                                ui.visuals().widgets.noninteractive.bg_stroke.color
+                            };
+                            main_ui.painter().rect_filled(
+                                divider_rect.shrink2(egui::vec2(2.0, 0.0)),
+                                1.0,
+                                color,
+                            );
+                            if resp.hovered() {
+                                main_ui.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                             }
                         }
                     }
-                });
+                }
 
                 // Граф связей.
                 if vs.show_graph {
