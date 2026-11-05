@@ -517,6 +517,7 @@ impl VaultState {
             }
 
             let output = egui::ScrollArea::both()
+                .id_salt("editor_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
@@ -550,6 +551,7 @@ impl VaultState {
         ui.strong("Preview");
         ui.separator();
         let actions = egui::ScrollArea::vertical()
+            .id_salt("preview_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(6.0);
@@ -856,6 +858,7 @@ impl eframe::App for App {
         {
             let mut top_ui = ui.new_child(
                 egui::UiBuilder::new()
+                    .id_salt("top")
                     .max_rect(full)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
@@ -980,7 +983,9 @@ impl eframe::App for App {
 
         match self.vault.as_mut() {
             None => {
-                let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                let mut main_ui = ui.new_child(
+                    egui::UiBuilder::new().id_salt("main").max_rect(main_rect),
+                );
                 main_ui.shrink_clip_rect(main_rect);
                 main_ui.centered_and_justified(|ui| {
                     if ui.button("Open vault…").clicked() {
@@ -990,7 +995,9 @@ impl eframe::App for App {
             }
             Some(vs) => {
                 // Дерево заметок.
-                let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(tree_rect));
+                let mut tree_ui = ui.new_child(
+                    egui::UiBuilder::new().id_salt("tree").max_rect(tree_rect),
+                );
                 tree_ui.shrink_clip_rect(tree_rect);
                 let tree_clicked = {
                     let ui = &mut tree_ui;
@@ -1024,6 +1031,7 @@ impl eframe::App for App {
                     if !vs.search_query.is_empty() {
                         let results = vs.index.search(&vs.search_query, 30);
                         egui::ScrollArea::vertical()
+                            .id_salt("search_list")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 if results.is_empty() {
@@ -1049,6 +1057,7 @@ impl eframe::App for App {
                     } else {
                         let selected = vs.open.clone();
                         let tree_click = egui::ScrollArea::vertical()
+                            .id_salt("note_tree")
                             .auto_shrink([false, false])
                             .show(ui, |ui| tree::show_tree(ui, &vs.tree, &selected))
                             .inner;
@@ -1085,7 +1094,9 @@ impl eframe::App for App {
                 }
 
                 // Основная область: редактор / предпросмотр / сплит.
-                let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(main_rect));
+                let mut main_ui = ui.new_child(
+                    egui::UiBuilder::new().id_salt("main").max_rect(main_rect),
+                );
                 main_ui.shrink_clip_rect(main_rect);
                 match vs.view_mode {
                     ViewMode::Edit => vs.ui_editor(&mut main_ui, now),
@@ -1113,13 +1124,15 @@ impl eframe::App for App {
                                 full.max,
                             );
 
-                            let mut editor_ui = main_ui
-                                .new_child(egui::UiBuilder::new().max_rect(editor_rect));
+                            let mut editor_ui = main_ui.new_child(
+                                egui::UiBuilder::new().id_salt("editor").max_rect(editor_rect),
+                            );
                             editor_ui.shrink_clip_rect(editor_rect);
                             vs.ui_editor(&mut editor_ui, now);
 
-                            let mut preview_ui = main_ui
-                                .new_child(egui::UiBuilder::new().max_rect(preview_rect));
+                            let mut preview_ui = main_ui.new_child(
+                                egui::UiBuilder::new().id_salt("preview").max_rect(preview_rect),
+                            );
                             preview_ui.shrink_clip_rect(preview_rect);
                             vs.ui_preview(&mut preview_ui);
 
@@ -1344,7 +1357,10 @@ impl eframe::App for App {
                             if entries.is_empty() {
                                 ui.weak("Ничего не найдено");
                             }
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("quick_list")
+                                .max_height(320.0)
+                                .show(ui, |ui| {
                                 for (i, (p, t)) in entries.iter().enumerate() {
                                     let label = format!("{t}  ·  {}", p.display());
                                     if ui.selectable_label(i == qo.selected, label).clicked() {
