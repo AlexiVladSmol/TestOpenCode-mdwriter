@@ -42,6 +42,7 @@ struct VaultState {
     dirty: bool,
     last_edit: Option<f64>,
     new_note_name: String,
+    show_preview: bool,
 }
 
 impl VaultState {
@@ -56,6 +57,7 @@ impl VaultState {
             dirty: false,
             last_edit: None,
             new_note_name: String::new(),
+            show_preview: true,
         };
         s.rescan();
         s
@@ -170,7 +172,9 @@ impl eframe::App for App {
                 if ui.button("Open vault…").clicked() {
                     self.open_vault();
                 }
-                if let Some(vs) = &self.vault {
+                if let Some(vs) = self.vault.as_mut() {
+                    ui.separator();
+                    ui.toggle_value(&mut vs.show_preview, "Preview");
                     ui.separator();
                     ui.label(vs.vault.root().display().to_string());
                 }
@@ -218,6 +222,24 @@ impl eframe::App for App {
                             vs.load(rel);
                         }
                     });
+
+                if vs.show_preview {
+                    egui::Panel::right("preview")
+                        .resizable(true)
+                        .default_size(560.0)
+                        .min_size(250.0)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            ui.strong("Preview");
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add_space(6.0);
+                                    preview::markdown(ui, &vs.editor_text);
+                                });
+                        });
+                }
 
                 egui::CentralPanel::default().show(ui, |ui| {
                     if vs.open.is_some() {

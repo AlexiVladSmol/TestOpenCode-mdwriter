@@ -1,0 +1,11 @@
+[package]
+name = "preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+pulldown-cmark.workspace = true

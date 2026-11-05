@@ -9,5 +9,6 @@ repository.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
+preview = { path = "../preview" }
 rfd.workspace = true
 vault = { path = "../vault" }
