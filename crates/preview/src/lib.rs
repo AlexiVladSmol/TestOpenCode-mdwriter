@@ -36,7 +36,15 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
     let body = wiki_links_to_md(body);
     let task_lines = collect_task_lines(&body);
     let mut task_counter = 0usize;
-    render_body(ui, &body, &task_lines, &mut task_counter, &mut actions);
+    let mut block_counter = 0usize;
+    render_body(
+        ui,
+        &body,
+        &task_lines,
+        &mut task_counter,
+        &mut block_counter,
+        &mut actions,
+    );
     actions
 }
 
@@ -119,6 +127,7 @@ fn render_body(
     md: &str,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     let mut options = Options::empty();
@@ -129,7 +138,14 @@ fn render_body(
     options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
     options.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(md, options);
-    render_blocks(ui, &mut parser.peekable(), task_lines, task_counter, actions);
+    render_blocks(
+        ui,
+        &mut parser.peekable(),
+        task_lines,
+        task_counter,
+        block_counter,
+        actions,
+    );
 }
 
 fn render_blocks(
@@ -137,6 +153,7 @@ fn render_blocks(
     events: &mut Peekable<Parser<'_>>,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     while let Some(ev) = events.peek().cloned() {
@@ -151,19 +168,35 @@ fn render_blocks(
             }
             Event::Start(Tag::List(start)) => {
                 events.next();
-                render_list(ui, events, start, task_lines, task_counter, actions);
+                render_list(
+                    ui,
+                    events,
+                    start,
+                    task_lines,
+                    task_counter,
+                    block_counter,
+                    actions,
+                );
             }
             Event::Start(Tag::BlockQuote(kind)) => {
                 events.next();
-                render_blockquote(ui, events, kind, task_lines, task_counter, actions);
+                render_blockquote(
+                    ui,
+                    events,
+                    kind,
+                    task_lines,
+                    task_counter,
+                    block_counter,
+                    actions,
+                );
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 events.next();
-                render_codeblock(ui, events, &kind);
+                render_codeblock(ui, events, &kind, block_counter);
             }
             Event::Start(Tag::Table(_)) => {
                 events.next();
-                render_table(ui, events);
+                render_table(ui, events, block_counter);
             }
             Event::DisplayMath(m) => {
                 events.next();
@@ -206,6 +239,7 @@ fn render_block_once(
     events: &mut Peekable<Parser<'_>>,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     match events.peek().cloned() {
@@ -219,19 +253,35 @@ fn render_block_once(
         }
         Some(Event::Start(Tag::List(start))) => {
             events.next();
-            render_list(ui, events, start, task_lines, task_counter, actions);
+            render_list(
+                ui,
+                events,
+                start,
+                task_lines,
+                task_counter,
+                block_counter,
+                actions,
+            );
         }
         Some(Event::Start(Tag::BlockQuote(kind))) => {
             events.next();
-            render_blockquote(ui, events, kind, task_lines, task_counter, actions);
+            render_blockquote(
+                ui,
+                events,
+                kind,
+                task_lines,
+                task_counter,
+                block_counter,
+                actions,
+            );
         }
         Some(Event::Start(Tag::CodeBlock(kind))) => {
             events.next();
-            render_codeblock(ui, events, &kind);
+            render_codeblock(ui, events, &kind, block_counter);
         }
         Some(Event::Start(Tag::Table(_))) => {
             events.next();
-            render_table(ui, events);
+            render_table(ui, events, block_counter);
         }
         Some(Event::DisplayMath(m)) => {
             events.next();
@@ -272,6 +322,7 @@ fn render_list(
     start: Option<u64>,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     let ordered = start.is_some();
@@ -280,7 +331,16 @@ fn render_list(
         match events.peek() {
             Some(Event::Start(Tag::Item)) => {
                 events.next();
-                render_item(ui, events, ordered, n, task_lines, task_counter, actions);
+                render_item(
+                    ui,
+                    events,
+                    ordered,
+                    n,
+                    task_lines,
+                    task_counter,
+                    block_counter,
+                    actions,
+                );
                 n += 1;
             }
             Some(Event::End(TagEnd::List(_))) => {
@@ -295,6 +355,7 @@ fn render_list(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_item(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
@@ -302,6 +363,7 @@ fn render_item(
     index: u64,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     // Задачи: `- [ ] ...` / `- [x] ...`. Маркер может идти сразу или после
@@ -351,7 +413,14 @@ fn render_item(
             }
             Some(Event::Start(_)) => {
                 ui.indent("nested", |ui| {
-                    render_block_once(ui, events, task_lines, task_counter, actions)
+                    render_block_once(
+                        ui,
+                        events,
+                        task_lines,
+                        task_counter,
+                        block_counter,
+                        actions,
+                    )
                 });
             }
             Some(_) => {
@@ -368,6 +437,7 @@ fn render_blockquote(
     kind: Option<BlockQuoteKind>,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     match kind {
@@ -388,7 +458,14 @@ fn render_blockquote(
                 .inner_margin(Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.label(RichText::new(name).color(color).strong());
-                    render_quote_content(ui, events, task_lines, task_counter, actions);
+                    render_quote_content(
+                        ui,
+                        events,
+                        task_lines,
+                        task_counter,
+                        block_counter,
+                        actions,
+                    );
                 });
         }
         None => {
@@ -401,7 +478,14 @@ fn render_blockquote(
                 .corner_radius(4.0)
                 .inner_margin(Margin::symmetric(10, 6))
                 .show(ui, |ui| {
-                    render_quote_content(ui, events, task_lines, task_counter, actions)
+                    render_quote_content(
+                        ui,
+                        events,
+                        task_lines,
+                        task_counter,
+                        block_counter,
+                        actions,
+                    )
                 });
         }
     }
@@ -412,6 +496,7 @@ fn render_quote_content(
     events: &mut Peekable<Parser<'_>>,
     task_lines: &[usize],
     task_counter: &mut usize,
+    block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     loop {
@@ -421,7 +506,14 @@ fn render_quote_content(
                 break;
             }
             Some(Event::Start(_)) => {
-                render_block_once(ui, events, task_lines, task_counter, actions)
+                render_block_once(
+                    ui,
+                    events,
+                    task_lines,
+                    task_counter,
+                    block_counter,
+                    actions,
+                )
             }
             Some(_) => {
                 events.next();
@@ -449,7 +541,15 @@ fn render_math_block(ui: &mut Ui, formula: &str) {
         });
 }
 
-fn render_codeblock(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, kind: &CodeBlockKind<'_>) {
+fn render_codeblock(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    kind: &CodeBlockKind<'_>,
+    block_counter: &mut usize,
+) {
+    let block_n = *block_counter;
+    *block_counter += 1;
+
     let mut code = String::new();
     while let Some(ev) = events.peek().cloned() {
         match ev {
@@ -482,13 +582,21 @@ fn render_codeblock(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, kind: &CodeB
         .corner_radius(4.0)
         .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.add(egui::Label::new(job).selectable(false));
-            });
+            egui::ScrollArea::horizontal()
+                .id_salt(("code_block", block_n))
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(job).selectable(false));
+                });
         });
 }
 
-fn render_table(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
+fn render_table(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    block_counter: &mut usize,
+) {
+    let block_n = *block_counter;
+    *block_counter += 1;
     // Собираем строки: (заголовок?, ячейки)
     let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
     let mut in_head = false;
@@ -531,7 +639,9 @@ fn render_table(ui: &mut Ui, events: &mut Peekable<Parser<'_>>) {
     egui::Frame::group(ui.style())
         .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt(("md_table", block_n))
+                .show(ui, |ui| {
                 egui::Grid::new("md_table")
                     .striped(true)
                     .min_col_width(60.0)
