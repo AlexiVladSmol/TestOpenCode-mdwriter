@@ -296,6 +296,7 @@ impl eframe::App for App {
 
         // Глобальные шорткаты (читаем до того, как виджеты успеют поглотить события).
         let ctrl_o = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
+        let ctrl_s = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
@@ -306,6 +307,9 @@ impl eframe::App for App {
                 vs.rescan();
             }
             vs.maybe_autosave(now, ui.ctx());
+            if ctrl_s {
+                vs.flush();
+            }
             if ctrl_o {
                 vs.quick_open = Some(QuickOpen {
                     query: String::new(),
