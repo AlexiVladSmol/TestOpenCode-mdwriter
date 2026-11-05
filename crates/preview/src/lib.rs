@@ -16,6 +16,9 @@ use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options
 pub enum Action {
     /// Клик по wikilink с целью `target` (без расширения).
     OpenWiki(String),
+    /// Клик по чекбоксу задачи. `line_in_body` — индекс строки в теле документа
+    /// (без учёта frontmatter).
+    ToggleTask { line_in_body: usize },
 }
 
 /// Рисует markdown-текст в `ui`. Возвращает действия (например, клики по ссылкам).
@@ -31,7 +34,9 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
     }
 
     let body = wiki_links_to_md(body);
-    render_body(ui, &body, &mut actions);
+    let task_lines = collect_task_lines(&body);
+    let mut task_counter = 0usize;
+    render_body(ui, &body, &task_lines, &mut task_counter, &mut actions);
     actions
 }
 
@@ -50,6 +55,41 @@ fn wiki_links_to_md(text: &str) -> String {
         last = w.range.end;
     }
     out.push_str(&text[last..]);
+    out
+}
+
+/// Строки-задачи (`- [ ]`, `* [x]`, `1. [ ]` и т.п.) вне огороженных блоков.
+/// Индексы строк в тексте (в том виде, в котором он отдан парсеру).
+fn collect_task_lines(body: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (i, raw) in body.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let b = trimmed.as_bytes();
+        let unordered = b.len() >= 5
+            && (b[0] == b'-' || b[0] == b'*' || b[0] == b'+')
+            && b[1] == b' '
+            && b[2] == b'['
+            && (b[3] == b' ' || b[3] == b'x' || b[3] == b'X')
+            && b[4] == b']';
+        let ordered = b.len() >= 7
+            && b[0].is_ascii_digit()
+            && b[1] == b'.'
+            && b[2] == b' '
+            && b[3] == b'['
+            && (b[4] == b' ' || b[4] == b'x' || b[4] == b'X')
+            && b[5] == b']';
+        if unordered || ordered {
+            out.push(i);
+        }
+    }
     out
 }
 
@@ -74,15 +114,31 @@ fn render_frontmatter(ui: &mut Ui, fm: &markdown::Frontmatter) {
 // Блоки
 // ---------------------------------------------------------------------------
 
-fn render_body(ui: &mut Ui, md: &str, actions: &mut Vec<Action>) {
+fn render_body(
+    ui: &mut Ui,
+    md: &str,
+    task_lines: &[usize],
+    task_counter: &mut usize,
+    actions: &mut Vec<Action>,
+) {
     let mut options = Options::empty();
-    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
     options.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(md, options);
-    render_blocks(ui, &mut parser.peekable(), actions);
+    render_blocks(ui, &mut parser.peekable(), task_lines, task_counter, actions);
 }
 
-fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
+fn render_blocks(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    task_lines: &[usize],
+    task_counter: &mut usize,
+    actions: &mut Vec<Action>,
+) {
     while let Some(ev) = events.peek().cloned() {
         match ev {
             Event::Start(Tag::Paragraph) => {
@@ -95,11 +151,11 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut V
             }
             Event::Start(Tag::List(start)) => {
                 events.next();
-                render_list(ui, events, start, actions);
+                render_list(ui, events, start, task_lines, task_counter, actions);
             }
             Event::Start(Tag::BlockQuote(kind)) => {
                 events.next();
-                render_blockquote(ui, events, kind, actions);
+                render_blockquote(ui, events, kind, task_lines, task_counter, actions);
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 events.next();
@@ -145,7 +201,13 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut V
 }
 
 /// Рендер одного блока (для вложенного контента: внутри пунктов списков и цитат).
-fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
+fn render_block_once(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    task_lines: &[usize],
+    task_counter: &mut usize,
+    actions: &mut Vec<Action>,
+) {
     match events.peek().cloned() {
         Some(Event::Start(Tag::Paragraph)) => {
             events.next();
@@ -157,11 +219,11 @@ fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &m
         }
         Some(Event::Start(Tag::List(start))) => {
             events.next();
-            render_list(ui, events, start, actions);
+            render_list(ui, events, start, task_lines, task_counter, actions);
         }
         Some(Event::Start(Tag::BlockQuote(kind))) => {
             events.next();
-            render_blockquote(ui, events, kind, actions);
+            render_blockquote(ui, events, kind, task_lines, task_counter, actions);
         }
         Some(Event::Start(Tag::CodeBlock(kind))) => {
             events.next();
@@ -208,6 +270,8 @@ fn render_list(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
     start: Option<u64>,
+    task_lines: &[usize],
+    task_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     let ordered = start.is_some();
@@ -216,7 +280,7 @@ fn render_list(
         match events.peek() {
             Some(Event::Start(Tag::Item)) => {
                 events.next();
-                render_item(ui, events, ordered, n, actions);
+                render_item(ui, events, ordered, n, task_lines, task_counter, actions);
                 n += 1;
             }
             Some(Event::End(TagEnd::List(_))) => {
@@ -236,6 +300,8 @@ fn render_item(
     events: &mut Peekable<Parser<'_>>,
     ordered: bool,
     index: u64,
+    task_lines: &[usize],
+    task_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     // Задачи: `- [ ] ...` / `- [x] ...`. Маркер может идти сразу или после
@@ -256,7 +322,13 @@ fn render_item(
             Some(checked) => {
                 ui.add_space(4.0);
                 let mut c = checked;
-                ui.checkbox(&mut c, "");
+                let line_in_body = task_lines.get(*task_counter).copied();
+                *task_counter += 1;
+                if ui.checkbox(&mut c, "").clicked() {
+                    if let Some(line_in_body) = line_in_body {
+                        actions.push(Action::ToggleTask { line_in_body });
+                    }
+                }
             }
             None => {
                 let marker = if ordered {
@@ -278,7 +350,9 @@ fn render_item(
                 break;
             }
             Some(Event::Start(_)) => {
-                ui.indent("nested", |ui| render_block_once(ui, events, actions));
+                ui.indent("nested", |ui| {
+                    render_block_once(ui, events, task_lines, task_counter, actions)
+                });
             }
             Some(_) => {
                 events.next();
@@ -292,6 +366,8 @@ fn render_blockquote(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
     kind: Option<BlockQuoteKind>,
+    task_lines: &[usize],
+    task_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
     match kind {
@@ -312,7 +388,7 @@ fn render_blockquote(
                 .inner_margin(Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.label(RichText::new(name).color(color).strong());
-                    render_quote_content(ui, events, actions);
+                    render_quote_content(ui, events, task_lines, task_counter, actions);
                 });
         }
         None => {
@@ -324,19 +400,29 @@ fn render_blockquote(
                 ))
                 .corner_radius(4.0)
                 .inner_margin(Margin::symmetric(10, 6))
-                .show(ui, |ui| render_quote_content(ui, events, actions));
+                .show(ui, |ui| {
+                    render_quote_content(ui, events, task_lines, task_counter, actions)
+                });
         }
     }
 }
 
-fn render_quote_content(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
+fn render_quote_content(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    task_lines: &[usize],
+    task_counter: &mut usize,
+    actions: &mut Vec<Action>,
+) {
     loop {
         match events.peek() {
             Some(Event::End(TagEnd::BlockQuote(_))) => {
                 events.next();
                 break;
             }
-            Some(Event::Start(_)) => render_block_once(ui, events, actions),
+            Some(Event::Start(_)) => {
+                render_block_once(ui, events, task_lines, task_counter, actions)
+            }
             Some(_) => {
                 events.next();
             }
@@ -804,6 +890,28 @@ mod tests {
     fn wiki_links_untouched_in_code() {
         let md = wiki_links_to_md("`[[не ссылка]]`");
         assert_eq!(md, "`[[не ссылка]]`");
+    }
+
+    #[test]
+    fn ordered_task_list_marker() {
+        let md = "1. [ ] один\n2. [x] два\n- [ ] три\n";
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_TASKLISTS);
+        let parser = Parser::new_ext(md, options);
+        let markers: Vec<bool> = parser
+            .filter_map(|e| match e {
+                Event::TaskListMarker(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec![false, true, false]);
+    }
+
+    #[test]
+    fn collect_task_lines_basic() {
+        let body = "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
+        let lines = collect_task_lines(body);
+        assert_eq!(lines, vec![0, 1, 2]);
     }
 
     #[test]

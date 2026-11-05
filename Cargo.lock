@@ -1305,6 +1305,7 @@ dependencies = [
  "egui_extras",
  "graph",
  "index",
+ "markdown",
  "preview",
  "pulldown-cmark",
  "rfd",

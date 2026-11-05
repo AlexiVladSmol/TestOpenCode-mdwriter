@@ -11,6 +11,7 @@ egui.workspace = true
 egui_extras.workspace = true
 graph = { path = "../graph" }
 index = { path = "../index" }
+markdown = { path = "../markdown" }
 preview = { path = "../preview" }
 pulldown-cmark.workspace = true
 rfd.workspace = true

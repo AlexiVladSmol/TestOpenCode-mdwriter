@@ -187,6 +187,45 @@ impl VaultState {
                     }
                 }
             }
+            preview::Action::ToggleTask { .. } => None,
+        }
+    }
+
+    /// Переключает `[ ]` ↔ `[x]` в исходнике по индексу строки тела документа.
+    fn toggle_task(&mut self, line_in_body: usize) {
+        // Смещение строки из-за frontmatter.
+        let fm_lines = match markdown::split_frontmatter(&self.editor_text) {
+            Some((_, body)) => {
+                let consumed = self.editor_text.len() - body.len();
+                self.editor_text[..consumed].bytes().filter(|&b| b == b'\n').count()
+            }
+            None => 0,
+        };
+        let line_idx = fm_lines + line_in_body;
+
+        // Начало и конец целевой строки.
+        let mut start = 0;
+        for _ in 0..line_idx {
+            let Some(rel) = self.editor_text[start..].find('\n') else {
+                return;
+            };
+            start += rel + 1;
+        }
+        let line_end = self.editor_text[start..]
+            .find('\n')
+            .map(|r| start + r)
+            .unwrap_or(self.editor_text.len());
+
+        let line = &self.editor_text[start..line_end];
+        for pat in ["[ ]", "[x]", "[X]"] {
+            if let Some(pos) = line.find(pat) {
+                let abs = start + pos;
+                let replacement = if pat == "[ ]" { "[x]" } else { "[ ]" };
+                self.editor_text.replace_range(abs..abs + 3, replacement);
+                self.dirty = true;
+                self.last_edit = None; // автосохранение сработает сразу
+                return;
+            }
         }
     }
 }
@@ -238,6 +277,10 @@ impl App {
         };
 
         let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+        options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
+        options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+        options.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
         options.insert(pulldown_cmark::Options::ENABLE_GFM);
         options.insert(pulldown_cmark::Options::ENABLE_MATH);
 
@@ -500,8 +543,15 @@ impl eframe::App for App {
                         })
                         .inner;
                     for action in actions {
-                        if let Some(rel) = vs.open_wiki(&action) {
-                            vs.load(rel);
+                        match action {
+                            preview::Action::OpenWiki(_) => {
+                                if let Some(rel) = vs.open_wiki(&action) {
+                                    vs.load(rel);
+                                }
+                            }
+                            preview::Action::ToggleTask { line_in_body } => {
+                                vs.toggle_task(line_in_body);
+                            }
                         }
                     }
                 }
