@@ -2,11 +2,12 @@
 
 mod tree;
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 
+use graph::GraphView;
 use index::Index;
 use vault::{Vault, VaultWatcher};
 
@@ -51,8 +52,10 @@ struct VaultState {
     last_edit: Option<f64>,
     new_note_name: String,
     show_preview: bool,
+    show_graph: bool,
     search_query: String,
     quick_open: Option<QuickOpen>,
+    graph: GraphView,
 }
 
 impl VaultState {
@@ -69,8 +72,10 @@ impl VaultState {
             last_edit: None,
             new_note_name: String::new(),
             show_preview: true,
+            show_graph: false,
             search_query: String::new(),
             quick_open: None,
+            graph: GraphView::default(),
         };
         s.rescan();
         s
@@ -82,6 +87,7 @@ impl VaultState {
             self.tree = tree::build_tree(&self.notes);
         }
         self.index = Index::build(&self.vault).unwrap_or_default();
+        self.graph.update(&self.index);
         // Если открытая заметка исчезла — закрываем её.
         if let Some(rel) = &self.open {
             if !self.notes.contains(rel) {
@@ -155,11 +161,31 @@ impl VaultState {
     }
 
     /// Разрешает действие предпросмотра в путь заметки.
-    fn open_wiki(&self, action: &preview::Action) -> Option<PathBuf> {
+    /// Несуществующую цель создаёт (как Obsidian) рядом с текущей заметкой.
+    fn open_wiki(&mut self, action: &preview::Action) -> Option<PathBuf> {
         match action {
             preview::Action::OpenWiki(target) => {
-                let from = self.open.as_deref()?;
-                self.index.resolve_wikilink(from, target)
+                let from = self.open.clone()?;
+                if let Some(rel) = self.index.resolve_wikilink(&from, target) {
+                    return Some(rel);
+                }
+                let name = if target.ends_with(".md") {
+                    target.to_string()
+                } else {
+                    format!("{target}.md")
+                };
+                let dir = from.parent().unwrap_or(Path::new(""));
+                let rel = dir.join(name);
+                match self.vault.create(&rel) {
+                    Ok(()) => {
+                        self.rescan();
+                        Some(rel)
+                    }
+                    Err(e) => {
+                        eprintln!("failed to create {rel:?}: {e}");
+                        None
+                    }
+                }
             }
         }
     }
@@ -176,6 +202,92 @@ impl App {
             }
         }
     }
+
+    /// Создаёт/открывает ежедневную заметку `ГГГГ-ММ-ДД.md` в корне vault.
+    fn open_today(&mut self) {
+        let Some(vs) = self.vault.as_mut() else {
+            return;
+        };
+        let rel = PathBuf::from(format!("{}.md", today_str()));
+        if let Err(e) = vs.vault.create(&rel) {
+            eprintln!("failed to create daily note: {e}");
+            return;
+        }
+        vs.rescan();
+        vs.load(rel);
+    }
+
+    /// Экспорт открытой заметки в HTML.
+    fn export_html(&mut self) {
+        let Some(vs) = &self.vault else { return };
+        let Some(rel) = &vs.open else { return };
+        let Ok(text) = vs.vault.read(rel) else {
+            return;
+        };
+        let default_name = format!(
+            "{}.html",
+            rel.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "note".to_string())
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_GFM);
+        options.insert(pulldown_cmark::Options::ENABLE_MATH);
+
+        let mut html = String::from(
+            "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>",
+        );
+        html.push_str(&escape_html(&default_name));
+        html.push_str(
+            "</title>\n<style>body{max-width:760px;margin:2em auto;padding:0 1em;font-family:\
+             system-ui,sans-serif;line-height:1.6}pre{background:#f5f5f5;padding:1em;\
+             overflow:auto}code{background:#f5f5f5;padding:.1em .3em}blockquote{border-left:\
+             4px solid #ccc;margin-left:0;padding-left:1em;color:#555}</style>\n</head>\n<body>\n",
+        );
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&text, options),
+        );
+        html.push_str("\n</body>\n</html>\n");
+
+        if let Err(e) = std::fs::write(&path, html) {
+            eprintln!("export failed: {e}");
+        }
+    }
+}
+
+/// Текущая дата (UTC) в формате `ГГГГ-ММ-ДД`.
+fn today_str() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    // civil_from_days (алгоритм Говарда Хиннанта)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 impl eframe::App for App {
@@ -212,11 +324,40 @@ impl eframe::App for App {
                 if ui.button("Open vault…").clicked() {
                     self.open_vault();
                 }
+                let mut open_today = false;
+                let mut export_html = false;
                 if let Some(vs) = self.vault.as_mut() {
                     ui.separator();
                     ui.toggle_value(&mut vs.show_preview, "Preview");
+                    ui.toggle_value(&mut vs.show_graph, "Graph");
+                    ui.separator();
+                    if ui
+                        .button("Today")
+                        .on_hover_text("Ежедневная заметка ГГГГ-ММ-ДД")
+                        .clicked()
+                    {
+                        open_today = true;
+                    }
+                    if ui.button("Export HTML").clicked() {
+                        export_html = true;
+                    }
                     ui.separator();
                     ui.label(vs.vault.root().display().to_string());
+                }
+                ui.separator();
+                let mut dark = ui.ctx().theme() == egui::Theme::Dark;
+                if ui.toggle_value(&mut dark, "Dark").changed() {
+                    ui.ctx().set_theme(if dark {
+                        egui::ThemePreference::Dark
+                    } else {
+                        egui::ThemePreference::Light
+                    });
+                }
+                if open_today {
+                    self.open_today();
+                }
+                if export_html {
+                    self.export_html();
                 }
             });
         });
@@ -433,6 +574,112 @@ impl eframe::App for App {
                         });
                     }
                 });
+
+                // Граф связей.
+                if vs.show_graph {
+                    let mut open = true;
+                    let mut clicked: Option<PathBuf> = None;
+                    egui::Window::new("Граф связей")
+                        .open(&mut open)
+                        .default_size([520.0, 420.0])
+                        .resizable(true)
+                        .show(ui.ctx(), |ui| {
+                            for _ in 0..3 {
+                                vs.graph.step();
+                            }
+                            let (response, painter) =
+                                ui.allocate_painter(ui.available_size(), egui::Sense::click());
+                            let rect = response.rect;
+                            if rect.width() < 2.0 || rect.height() < 2.0 {
+                                return;
+                            }
+                            painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+
+                            let n = vs.graph.node_count();
+                            if n == 0 {
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Пока нет заметок",
+                                    egui::FontId::proportional(14.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                                return;
+                            }
+
+                            // Границы позиций и масштаб.
+                            let mut min = egui::Vec2::splat(f32::INFINITY);
+                            let mut max = egui::Vec2::splat(f32::NEG_INFINITY);
+                            for i in 0..n {
+                                if let Some((_, _, p)) = vs.graph.node(i) {
+                                    let p = p.to_vec2();
+                                    min = min.min(p);
+                                    max = max.max(p);
+                                }
+                            }
+                            let size = (max - min).max(egui::Vec2::splat(1.0));
+                            let scale = ((rect.width() - 60.0) / size.x)
+                                .min((rect.height() - 60.0) / size.y)
+                                .min(4.0);
+                            let offset = rect.center() - (min + max) * 0.5 * scale;
+                            let map = |p: egui::Pos2| {
+                                egui::Pos2::new(offset.x + p.x * scale, offset.y + p.y * scale)
+                            };
+
+                            // Рёбра.
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            );
+                            for (a, b) in vs.graph.edge_pairs() {
+                                let (Some((_, _, pa)), Some((_, _, pb))) =
+                                    (vs.graph.node(a), vs.graph.node(b))
+                                else {
+                                    continue;
+                                };
+                                painter.line_segment([map(pa), map(pb)], stroke);
+                            }
+
+                            // Узлы.
+                            let click_pos = response
+                                .clicked()
+                                .then(|| response.interact_pointer_pos())
+                                .flatten()
+                                .unwrap_or(rect.center());
+                            for i in 0..n {
+                                let Some((title, path, p)) = vs.graph.node(i) else {
+                                    continue;
+                                };
+                                let center = map(p);
+                                let is_open = vs.open.as_deref() == Some(path);
+                                let color = if is_open {
+                                    ui.visuals().selection.bg_fill
+                                } else {
+                                    ui.visuals().widgets.inactive.fg_stroke.color
+                                };
+                                painter.circle_filled(
+                                    center,
+                                    if is_open { 7.0 } else { 5.0 },
+                                    color,
+                                );
+                                painter.text(
+                                    center + egui::vec2(0.0, 10.0),
+                                    egui::Align2::CENTER_TOP,
+                                    title,
+                                    egui::FontId::proportional(11.0),
+                                    ui.visuals().text_color(),
+                                );
+                                if response.clicked() && (click_pos - center).length() < 14.0 {
+                                    clicked = Some(path.to_path_buf());
+                                }
+                            }
+                        });
+
+                    vs.show_graph = open;
+                    if let Some(rel) = clicked {
+                        vs.load(rel);
+                    }
+                }
 
                 // Быстрый переключатель (Ctrl+O).
                 if vs.quick_open.is_some() {

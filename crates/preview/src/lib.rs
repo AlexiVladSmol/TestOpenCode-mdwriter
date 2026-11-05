@@ -8,8 +8,8 @@
 use std::iter::Peekable;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{FontId, Margin, RichText, Stroke, TextStyle, Ui};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use egui::{Color32, FontId, Margin, RichText, Stroke, TextStyle, Ui};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Действие, которое пользователь запросил в предпросмотре.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,10 +76,8 @@ fn render_frontmatter(ui: &mut Ui, fm: &markdown::Frontmatter) {
 
 fn render_body(ui: &mut Ui, md: &str, actions: &mut Vec<Action>) {
     let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(md, options);
     render_blocks(ui, &mut parser.peekable(), actions);
 }
@@ -99,9 +97,9 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut V
                 events.next();
                 render_list(ui, events, start, actions);
             }
-            Event::Start(Tag::BlockQuote(_)) => {
+            Event::Start(Tag::BlockQuote(kind)) => {
                 events.next();
-                render_blockquote(ui, events, actions);
+                render_blockquote(ui, events, kind, actions);
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 events.next();
@@ -110,6 +108,10 @@ fn render_blocks(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut V
             Event::Start(Tag::Table(_)) => {
                 events.next();
                 render_table(ui, events);
+            }
+            Event::DisplayMath(m) => {
+                events.next();
+                render_math_block(ui, &m);
             }
             Event::Start(Tag::FootnoteDefinition(_)) => {
                 events.next();
@@ -157,9 +159,9 @@ fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &m
             events.next();
             render_list(ui, events, start, actions);
         }
-        Some(Event::Start(Tag::BlockQuote(_))) => {
+        Some(Event::Start(Tag::BlockQuote(kind))) => {
             events.next();
-            render_blockquote(ui, events, actions);
+            render_blockquote(ui, events, kind, actions);
         }
         Some(Event::Start(Tag::CodeBlock(kind))) => {
             events.next();
@@ -168,6 +170,10 @@ fn render_block_once(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &m
         Some(Event::Start(Tag::Table(_))) => {
             events.next();
             render_table(ui, events);
+        }
+        Some(Event::DisplayMath(m)) => {
+            events.next();
+            render_math_block(ui, &m);
         }
         _ => {}
     }
@@ -282,29 +288,78 @@ fn render_item(
     }
 }
 
-fn render_blockquote(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
+fn render_blockquote(
+    ui: &mut Ui,
+    events: &mut Peekable<Parser<'_>>,
+    kind: Option<BlockQuoteKind>,
+    actions: &mut Vec<Action>,
+) {
+    match kind {
+        // GFM-alert / Obsidian-callout: `> [!NOTE]` и т.п.
+        Some(k) => {
+            let (name, color) = match k {
+                BlockQuoteKind::Note => ("NOTE", Color32::from_rgb(59, 130, 246)),
+                BlockQuoteKind::Tip => ("TIP", Color32::from_rgb(34, 197, 94)),
+                BlockQuoteKind::Important => ("IMPORTANT", Color32::from_rgb(139, 92, 246)),
+                BlockQuoteKind::Warning => ("WARNING", Color32::from_rgb(245, 158, 11)),
+                BlockQuoteKind::Caution => ("CAUTION", Color32::from_rgb(239, 68, 68)),
+            };
+            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24);
+            egui::Frame::default()
+                .fill(fill)
+                .stroke(Stroke::new(2.0, color))
+                .corner_radius(6.0)
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(name).color(color).strong());
+                    render_quote_content(ui, events, actions);
+                });
+        }
+        None => {
+            egui::Frame::default()
+                .fill(ui.visuals().faint_bg_color)
+                .stroke(Stroke::new(
+                    1.0,
+                    ui.visuals().widgets.noninteractive.bg_stroke.color,
+                ))
+                .corner_radius(4.0)
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| render_quote_content(ui, events, actions));
+        }
+    }
+}
+
+fn render_quote_content(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, actions: &mut Vec<Action>) {
+    loop {
+        match events.peek() {
+            Some(Event::End(TagEnd::BlockQuote(_))) => {
+                events.next();
+                break;
+            }
+            Some(Event::Start(_)) => render_block_once(ui, events, actions),
+            Some(_) => {
+                events.next();
+            }
+            None => break,
+        }
+    }
+}
+
+fn render_math_block(ui: &mut Ui, formula: &str) {
+    let color = ui.visuals().weak_text_color();
     egui::Frame::default()
         .fill(ui.visuals().faint_bg_color)
-        .stroke(Stroke::new(
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-        ))
         .corner_radius(4.0)
-        .inner_margin(Margin::symmetric(10, 6))
+        .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            loop {
-                match events.peek() {
-                    Some(Event::End(TagEnd::BlockQuote(_))) => {
-                        events.next();
-                        break;
-                    }
-                    Some(Event::Start(_)) => render_block_once(ui, events, actions),
-                    Some(_) => {
-                        events.next();
-                    }
-                    None => break,
-                }
-            }
+            ui.centered_and_justified(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(formula).monospace().italics().color(color),
+                    )
+                    .selectable(false),
+                );
+            });
         });
 }
 
@@ -668,12 +723,11 @@ fn collect_inline(
             }
             Event::InlineMath(m) => {
                 events.next();
-                push(
-                    &mut job,
-                    &m,
-                    stack.last().unwrap().clone(),
-                    &mut char_cursor,
-                );
+                let mut f = stack.last().unwrap().clone();
+                f.font_id = FontId::monospace(f.font_id.size * 0.95);
+                f.italics = true;
+                f.background = ui.visuals().faint_bg_color;
+                push(&mut job, &m, f, &mut char_cursor);
             }
             Event::FootnoteReference(r) => {
                 events.next();
@@ -682,8 +736,12 @@ fn collect_inline(
                 f.color = ui.visuals().hyperlink_color;
                 push(&mut job, &format!("[{r}]"), f, &mut char_cursor);
             }
-            Event::Rule | Event::DisplayMath(_) | Event::TaskListMarker(_) => {
+            Event::Rule | Event::TaskListMarker(_) => {
                 events.next();
+            }
+            Event::DisplayMath(_) => {
+                // Блочная математика рисуется на уровне блоков — прерываем инлайн.
+                break;
             }
             Event::Html(_) => {
                 // Сырой HTML-блок в предпросмотре не интерпретируем.

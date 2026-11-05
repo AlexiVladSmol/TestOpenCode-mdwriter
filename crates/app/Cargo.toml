@@ -9,7 +9,9 @@ repository.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
+graph = { path = "../graph" }
 index = { path = "../index" }
 preview = { path = "../preview" }
+pulldown-cmark.workspace = true
 rfd.workspace = true
 vault = { path = "../vault" }
