@@ -26,15 +26,13 @@ fn editor_id() -> egui::Id {
 }
 
 /// Режим отображения: только редактор / сплит / только предпросмотр.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 enum ViewMode {
     Edit,
     #[default]
     Split,
     Preview,
 }
-
 
 impl ViewMode {
     fn next(self) -> Self {
@@ -55,8 +53,7 @@ impl ViewMode {
 }
 
 /// Тема оформления.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 enum ThemeChoice {
     #[default]
     System,
@@ -64,7 +61,6 @@ enum ThemeChoice {
     Light,
     Nord,
 }
-
 
 impl ThemeChoice {
     fn next(self) -> Self {
@@ -109,8 +105,7 @@ fn nord_visuals() -> egui::Visuals {
     v.extreme_bg_color = NORD0;
     v.code_bg_color = NORD1;
     v.hyperlink_color = NORD8;
-    v.selection.bg_fill =
-        Color32::from_rgba_unmultiplied(NORD10.r(), NORD10.g(), NORD10.b(), 110);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(NORD10.r(), NORD10.g(), NORD10.b(), 110);
     v.selection.stroke = Stroke::new(1.0, NORD9);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, NORD4);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, NORD2);
@@ -713,7 +708,10 @@ impl VaultState {
         let fm_lines = match markdown::split_frontmatter(&self.editor_text) {
             Some((_, body)) => {
                 let consumed = self.editor_text.len() - body.len();
-                self.editor_text[..consumed].bytes().filter(|&b| b == b'\n').count()
+                self.editor_text[..consumed]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
             }
             None => 0,
         };
@@ -764,9 +762,11 @@ impl VaultState {
 
     fn set_cursor(&mut self, ctx: &egui::Context, char_idx: usize) {
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id()) {
-            state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(
-                egui::text::CCursor::new(char_idx),
-            )));
+            state
+                .cursor
+                .set_char_range(Some(egui::text_selection::CCursorRange::one(
+                    egui::text::CCursor::new(char_idx),
+                )));
             egui::TextEdit::store_state(ctx, editor_id(), state);
         }
     }
@@ -951,18 +951,17 @@ impl VaultState {
 
             let theme =
                 egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-            let mut layouter =
-                |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let mut job = egui_extras::syntax_highlighting::highlight(
-                        ui.ctx(),
-                        ui.style(),
-                        &theme,
-                        buf.as_str(),
-                        "md",
-                    );
-                    job.wrap.max_width = wrap_width;
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
+            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                let mut job = egui_extras::syntax_highlighting::highlight(
+                    ui.ctx(),
+                    ui.style(),
+                    &theme,
+                    buf.as_str(),
+                    "md",
+                );
+                job.wrap.max_width = wrap_width;
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
 
             let n_lines = self.editor_text.lines().count();
             let digits = n_lines.to_string().len().max(2);
@@ -1134,7 +1133,9 @@ impl App {
         }
 
         // Размер окна сохраняем всегда (но без флага dirty — пишем при выходе).
-        if let Some(size) = ctx.input(|i| i.viewport().inner_rect).map(|r| [r.width(), r.height()])
+        if let Some(size) = ctx
+            .input(|i| i.viewport().inner_rect)
+            .map(|r| [r.width(), r.height()])
         {
             self.settings.window_size = Some(size);
         }
@@ -1218,9 +1219,8 @@ impl App {
 
         let options = markdown::cmark_options();
 
-        let mut html = String::from(
-            "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>",
-        );
+        let mut html =
+            String::from("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>");
         html.push_str(&escape_html(&default_name));
         html.push_str(
             "</title>\n<style>body{max-width:760px;margin:2em auto;padding:0 1em;font-family:\
@@ -1228,10 +1228,7 @@ impl App {
              overflow:auto}code{background:#f5f5f5;padding:.1em .3em}blockquote{border-left:\
              4px solid #ccc;margin-left:0;padding-left:1em;color:#555}</style>\n</head>\n<body>\n",
         );
-        pulldown_cmark::html::push_html(
-            &mut html,
-            pulldown_cmark::Parser::new_ext(&text, options),
-        );
+        pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new_ext(&text, options));
         html.push_str("\n</body>\n</html>\n");
 
         match std::fs::write(&path, html) {
@@ -1496,7 +1493,11 @@ impl eframe::App for App {
                         if ui.small_button("link").on_hover_text("Ссылка").clicked() {
                             vs.fmt_link(ui.ctx());
                         }
-                        if ui.small_button("—").on_hover_text("Горизонтальная линия").clicked() {
+                        if ui
+                            .small_button("—")
+                            .on_hover_text("Горизонтальная линия")
+                            .clicked()
+                        {
                             vs.wrap_selection(ui.ctx(), "\n---\n", "");
                         }
                     });
@@ -1515,17 +1516,14 @@ impl eframe::App for App {
             egui::pos2(full.min.x, top_h),
             egui::pos2(full.min.x + tree_w, full.max.y),
         );
-        let main_rect = egui::Rect::from_min_max(
-            egui::pos2(full.min.x + tree_w, top_h),
-            full.max,
-        );
-        ui.painter().vline(tree_rect.max.x, tree_rect.y_range(), sep_stroke);
+        let main_rect = egui::Rect::from_min_max(egui::pos2(full.min.x + tree_w, top_h), full.max);
+        ui.painter()
+            .vline(tree_rect.max.x, tree_rect.y_range(), sep_stroke);
 
         match self.vault.as_mut() {
             None => {
-                let mut main_ui = ui.new_child(
-                    egui::UiBuilder::new().id_salt("main").max_rect(main_rect),
-                );
+                let mut main_ui =
+                    ui.new_child(egui::UiBuilder::new().id_salt("main").max_rect(main_rect));
                 main_ui.shrink_clip_rect(main_rect);
                 main_ui.centered_and_justified(|ui| {
                     if ui.button("Open vault…").clicked() {
@@ -1535,9 +1533,8 @@ impl eframe::App for App {
             }
             Some(vs) => {
                 // Дерево заметок.
-                let mut tree_ui = ui.new_child(
-                    egui::UiBuilder::new().id_salt("tree").max_rect(tree_rect),
-                );
+                let mut tree_ui =
+                    ui.new_child(egui::UiBuilder::new().id_salt("tree").max_rect(tree_rect));
                 tree_ui.shrink_clip_rect(tree_rect);
                 let tree_clicked = {
                     let ui = &mut tree_ui;
@@ -1549,9 +1546,10 @@ impl eframe::App for App {
                             .hint_text("note.md")
                             .desired_width(110.0);
                         let resp = ui.add(name_edit);
-                        let enter = resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui.button("+").on_hover_text("Новая заметка").clicked() || enter {
+                        let enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("+").on_hover_text("Новая заметка").clicked() || enter
+                        {
                             vs.create_note();
                         }
                     });
@@ -1578,8 +1576,7 @@ impl eframe::App for App {
                                     ui.weak("Ничего не найдено");
                                 }
                                 for (rel, snippet) in results {
-                                    let title =
-                                        vs.index.title(&rel).unwrap_or("").to_string();
+                                    let title = vs.index.title(&rel).unwrap_or("").to_string();
                                     ui.vertical(|ui| {
                                         if ui
                                             .selectable_label(
@@ -1634,9 +1631,8 @@ impl eframe::App for App {
                 }
 
                 // Основная область: редактор / предпросмотр / сплит.
-                let mut main_ui = ui.new_child(
-                    egui::UiBuilder::new().id_salt("main").max_rect(main_rect),
-                );
+                let mut main_ui =
+                    ui.new_child(egui::UiBuilder::new().id_salt("main").max_rect(main_rect));
                 main_ui.shrink_clip_rect(main_rect);
                 match vs.view_mode {
                     ViewMode::Edit => vs.ui_editor(&mut main_ui, now),
@@ -1648,8 +1644,8 @@ impl eframe::App for App {
                             vs.ui_editor(&mut main_ui, now);
                         } else {
                             const DIVIDER_W: f32 = 6.0;
-                            let preview_w = (full.width() * vs.preview_frac)
-                                .clamp(240.0, full.width() - 340.0);
+                            let preview_w =
+                                (full.width() * vs.preview_frac).clamp(240.0, full.width() - 340.0);
                             let divider_x = full.max.x - preview_w;
                             let editor_rect = egui::Rect::from_min_max(
                                 full.min,
@@ -1665,13 +1661,17 @@ impl eframe::App for App {
                             );
 
                             let mut editor_ui = main_ui.new_child(
-                                egui::UiBuilder::new().id_salt("editor").max_rect(editor_rect),
+                                egui::UiBuilder::new()
+                                    .id_salt("editor")
+                                    .max_rect(editor_rect),
                             );
                             editor_ui.shrink_clip_rect(editor_rect);
                             vs.ui_editor(&mut editor_ui, now);
 
                             let mut preview_ui = main_ui.new_child(
-                                egui::UiBuilder::new().id_salt("preview").max_rect(preview_rect),
+                                egui::UiBuilder::new()
+                                    .id_salt("preview")
+                                    .max_rect(preview_rect),
                             );
                             preview_ui.shrink_clip_rect(preview_rect);
                             vs.ui_preview(&mut preview_ui);
@@ -1877,8 +1877,8 @@ impl eframe::App for App {
                             let mut chosen: Option<PathBuf> = None;
                             let mut close = false;
                             if down {
-                                qo.selected = (qo.selected + 1)
-                                    .min(entries.len().saturating_sub(1));
+                                qo.selected =
+                                    (qo.selected + 1).min(entries.len().saturating_sub(1));
                             }
                             if up {
                                 qo.selected = qo.selected.saturating_sub(1);
@@ -1901,14 +1901,14 @@ impl eframe::App for App {
                                 .id_salt("quick_list")
                                 .max_height(320.0)
                                 .show(ui, |ui| {
-                                for (i, (p, t)) in entries.iter().enumerate() {
-                                    let label = format!("{t}  ·  {}", p.display());
-                                    if ui.selectable_label(i == qo.selected, label).clicked() {
-                                        chosen = Some(p.clone());
-                                        close = true;
+                                    for (i, (p, t)) in entries.iter().enumerate() {
+                                        let label = format!("{t}  ·  {}", p.display());
+                                        if ui.selectable_label(i == qo.selected, label).clicked() {
+                                            chosen = Some(p.clone());
+                                            close = true;
+                                        }
                                     }
-                                }
-                            });
+                                });
                             ui.separator();
                             ui.weak("Enter — открыть · Esc — закрыть");
 
