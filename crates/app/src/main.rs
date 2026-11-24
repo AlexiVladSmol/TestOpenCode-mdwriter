@@ -429,7 +429,11 @@ impl eframe::App for App {
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        // Стабильный id: на него ставим фокус, если «+» или Enter
+                        // нажали с пустым именем (см. ниже).
+                        let name_id = egui::Id::unique("mdwriter_new_note_name");
                         let name_edit = egui::TextEdit::singleline(&mut vs.new_note_name)
+                            .id(name_id)
                             .hint_text("note.md")
                             .desired_width(110.0);
                         let resp = ui.add(name_edit);
@@ -437,7 +441,14 @@ impl eframe::App for App {
                             resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if ui.button("+").on_hover_text("Новая заметка").clicked() || enter
                         {
-                            vs.create_note();
+                            if vs.new_note_name.trim().is_empty() {
+                                // Имя пустое — это не ошибка: Enter часто жмут,
+                                // чтобы открыть заметку. Просто ставим курсор
+                                // в поле, чтобы имя можно было ввести.
+                                ui.memory_mut(|m| m.request_focus(name_id));
+                            } else {
+                                vs.create_note();
+                            }
                         }
                     });
 

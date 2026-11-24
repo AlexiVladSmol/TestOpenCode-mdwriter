@@ -508,6 +508,13 @@ impl VaultState {
     }
 
     pub(crate) fn create_note(&mut self) {
+        // Пустое имя — не ошибка: панель дерева в этом случае просто ставит
+        // фокус в поле (см. `main.rs`), а сюда попадают только с непустым.
+        // Молча выходим, чтобы Enter «на открытие заметки» не показывал
+        // «Имя заметки пустое».
+        if self.new_note_name.trim().is_empty() {
+            return;
+        }
         let rel = match validate_note_name(&self.new_note_name) {
             Ok(rel) => rel,
             Err(msg) => {
@@ -1245,6 +1252,41 @@ mod tests {
         vs.load(PathBuf::from("b.md"));
         assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
         assert_eq!(vs.editor_text, "мои");
+    }
+
+    // ------------- Пустое имя новой заметки -------------
+
+    /// Enter в поле «новая заметка» с пустым именем — не ошибка:
+    /// ничего не создаётся и «Имя заметки пустое» не показывается.
+    #[test]
+    fn empty_note_name_is_not_an_error() {
+        let (mut vs, dir) = open_a();
+        for name in ["", "   ", "\t"] {
+            vs.new_note_name = name.to_string();
+            vs.create_note();
+        }
+        assert!(
+            vs.notices.items().is_empty(),
+            "уведомлений быть не должно: {:?}",
+            vs.notices.items()
+        );
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["a.md".to_string()], "новых файлов нет");
+    }
+
+    /// Имя из одних пробелов вокруг нормального текста по-прежнему работает.
+    #[test]
+    fn create_note_trims_surrounding_spaces() {
+        let (mut vs, dir) = open_a();
+        vs.new_note_name = "  Новая  ".to_string();
+        vs.create_note();
+        assert!(vs.notices.items().is_empty());
+        assert!(dir.join("Новая.md").exists());
+        assert_eq!(vs.open.as_deref(), Some(Path::new("Новая.md")));
+        assert!(vs.new_note_name.is_empty(), "поле очищено");
     }
 
     // ------------- Ревью этапа 3: доработки B4 и B5 -------------

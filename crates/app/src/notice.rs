@@ -13,6 +13,12 @@ use eframe::egui;
 
 /// Сколько секунд висит информационное уведомление.
 const INFO_TTL: f64 = 5.0;
+/// Сколько секунд висит ошибка, если пользователь её не закрыл.
+/// Дольше, чем Info: ошибку надо успеть прочитать, но и висеть вечно она не
+/// должна — иначе старая ошибка «догоняет» пользователя через несколько
+/// успешных действий. Ошибки с ключом (`error_keyed`) — это состояние
+/// (например, «не сохраняется заметка»), их снимает только `clear_key`.
+const ERROR_TTL: f64 = 20.0;
 /// Максимум одновременно показанных уведомлений.
 const MAX_ITEMS: usize = 5;
 
@@ -132,13 +138,14 @@ impl Notices {
         for n in items.iter_mut() {
             n.shown_at.get_or_insert(now);
         }
-        items.retain(|n| {
-            n.level == NoticeLevel::Error || now - n.shown_at.unwrap_or(now) < INFO_TTL
+        items.retain(|n| match expiry(n) {
+            // Ключевые ошибки живут, пока проблема не разрешена.
+            None => true,
+            Some(ttl) => now - n.shown_at.unwrap_or(now) < ttl,
         });
         items
             .iter()
-            .filter(|n| n.level == NoticeLevel::Info)
-            .map(|n| INFO_TTL - (now - n.shown_at.unwrap_or(now)))
+            .filter_map(|n| expiry(n).map(|ttl| ttl - (now - n.shown_at.unwrap_or(now))))
             .reduce(f64::min)
     }
 
@@ -187,6 +194,16 @@ impl Notices {
     }
 }
 
+/// Через сколько секунд уведомление скрывается; `None` — само не исчезнет
+/// (ключевые ошибки снимаются `clear_key`, когда проблема разрешилась).
+fn expiry(n: &Notice) -> Option<f64> {
+    match n.level {
+        NoticeLevel::Info => Some(INFO_TTL),
+        NoticeLevel::Error if n.key.is_some() => None,
+        NoticeLevel::Error => Some(ERROR_TTL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,16 +222,32 @@ mod tests {
     }
 
     #[test]
-    fn info_expires_error_stays() {
+    fn info_expires_first_then_plain_error() {
         let n = Notices::default();
         n.info("инфо");
         n.error("ошибка");
+        // Ближайший срок — у Info.
         assert_eq!(n.tick(10.0), Some(INFO_TTL));
         assert_eq!(n.items().len(), 2);
-        assert_eq!(n.tick(10.0 + INFO_TTL + 0.1), None);
-        let items = n.items();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].level, NoticeLevel::Error);
+        // Info исчезла, ошибка ещё видна и теперь её срок — ближайший.
+        let left = n.tick(10.0 + INFO_TTL + 0.1);
+        assert!(left.is_some_and(|s| (s - (ERROR_TTL - INFO_TTL - 0.1)).abs() < 1e-6));
+        assert_eq!(n.items().len(), 1);
+        assert_eq!(n.items()[0].level, NoticeLevel::Error);
+        // Обычная ошибка тоже уходит сама, а не висит до конца сеанса.
+        assert_eq!(n.tick(10.0 + ERROR_TTL + 0.1), None);
+        assert!(n.items().is_empty());
+    }
+
+    #[test]
+    fn keyed_error_stays_until_cleared() {
+        let n = Notices::default();
+        n.error_keyed("save:a.md", "Не удалось сохранить a.md");
+        assert_eq!(n.tick(0.0), None, "у ключевой ошибки нет таймера");
+        assert_eq!(n.tick(ERROR_TTL * 10.0), None);
+        assert_eq!(n.items().len(), 1);
+        assert!(n.clear_key("save:a.md"));
+        assert!(n.items().is_empty());
     }
 
     #[test]
