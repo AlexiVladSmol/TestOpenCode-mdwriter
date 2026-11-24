@@ -701,6 +701,10 @@ impl App {
 
     fn open_vault(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            // Перед сменой vault дописываем несохранённую заметку старого vault.
+            if let Some(vs) = &mut self.vault {
+                vs.flush();
+            }
             match VaultWatcher::new(&path) {
                 Ok(watcher) => {
                     let mut vs = VaultState::open(Vault::open(path.clone()), watcher);
@@ -1511,6 +1515,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Текст, набранный за последнюю секунду (AUTOSAVE_DELAY), иначе теряется.
+        if let Some(vs) = &mut self.vault {
+            vs.flush();
+        }
         self.save_settings();
     }
 }
