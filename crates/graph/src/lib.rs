@@ -11,9 +11,20 @@ use petgraph::Undirected;
 /// Тип неориентированного графа заметок.
 type GraphTy = PGraph<String, (), Undirected>;
 
-/// Порог «граф успокоился»: суммарная кинетическая энергия, ниже которой
-/// дальнейшие шаги ничего не меняют на глаз.
-const SETTLE_ENERGY: f32 = 0.5;
+/// Порог «граф успокоился»: **средняя** кинетическая энергия на узел.
+///
+/// Сравнивать суммарную энергию нельзя: она растёт с числом узлов, и граф из
+/// 300+ заметок не затихал бы никогда — даже за 3000 кадров (замер Claude).
+const SETTLE_ENERGY_PER_NODE: f32 = 0.02;
+
+/// Страховка: максимум шагов симуляции на одну раскладку.
+///
+/// На больших графах энергия не сходится к нулю вообще: силы отталкивания
+/// растут с числом узлов, и средняя энергия на узел колеблется в десятках
+/// (замер на 320 заметках: от 27 до 440 даже после 1200 шагов). Поэтому
+/// порог ловит малые и средние графы, а большие останавливает этот бюджет —
+/// иначе окно графа крутило бы симуляцию бесконечно.
+const MAX_ANIMATION_STEPS: u32 = 900;
 
 /// Граф заметок с позициями узлов для отрисовки.
 pub struct GraphView {
@@ -25,6 +36,9 @@ pub struct GraphView {
     vel: Vec<Vec2>,
     /// Симуляция успокоилась: шаги прекращаются, пока граф не изменят.
     settled: bool,
+    /// Сколько шагов сделано с последнего `update`/`wake` (страховка от
+    /// бесконечной анимации).
+    steps_done: u32,
 }
 
 impl Default for GraphView {
@@ -36,6 +50,7 @@ impl Default for GraphView {
             pos: Vec::new(),
             vel: Vec::new(),
             settled: false,
+            steps_done: 0,
         }
     }
 }
@@ -51,8 +66,9 @@ impl GraphView {
             .collect();
 
         self.rebuild(index);
-        // Новый граф — снова есть что раскладывать.
+        // Новый граф — снова есть что раскладывать, бюджет шагов заново.
         self.settled = false;
+        self.steps_done = 0;
 
         for (i, p) in self.paths.iter().enumerate() {
             if let Some(v) = old.get(p) {
@@ -164,8 +180,13 @@ impl GraphView {
         if self.settled {
             return false;
         }
+        let nodes = self.pos.len().max(1) as f32;
         for _ in 0..steps.max(1) {
-            if self.step() < SETTLE_ENERGY {
+            let energy = self.step();
+            self.steps_done += 1;
+            let settled_by_energy = energy / nodes < SETTLE_ENERGY_PER_NODE;
+            let out_of_budget = self.steps_done >= MAX_ANIMATION_STEPS;
+            if settled_by_energy || out_of_budget {
                 self.settled = true;
                 break;
             }
@@ -181,6 +202,12 @@ impl GraphView {
     /// Будит симуляцию: граф изменили или пользователь тронул узел.
     pub fn wake(&mut self) {
         self.settled = false;
+        self.steps_done = 0;
+    }
+
+    /// Сколько шагов симуляции сделано с последней сборки/пробуждения.
+    pub fn steps_done(&self) -> u32 {
+        self.steps_done
     }
 
     pub fn node_count(&self) -> usize {
@@ -270,6 +297,52 @@ mod tests {
         assert!(!graph.animate(3));
         assert!(graph.settled());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Граф из 300+ заметок (та же плотность связей, что в реальном vault)
+    /// должен успокаиваться за ограниченное число кадров, а не крутиться вечно.
+    #[test]
+    fn large_graph_settles_within_bounded_frames() {
+        let (vault, dir) = temp_vault("big");
+        let n = 320;
+        for i in 0..n {
+            let links: String = (1..=3)
+                .map(|k| format!("[[note{}]]", (i + k * 7) % n))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vault
+                .write(
+                    Path::new(&format!("note{i}.md")),
+                    &format!("# {i}\n{links}"),
+                )
+                .unwrap();
+        }
+        let index = Index::build(&vault).unwrap();
+        let mut graph = GraphView::default();
+        graph.update(&index);
+        assert_eq!(graph.node_count(), n);
+
+        let frames = count_frames_until_settled(&mut graph);
+        assert!(
+            graph.settled(),
+            "не успокоился за {frames} кадров ({} шагов)",
+            graph.steps_done()
+        );
+        assert!(
+            frames <= (MAX_ANIMATION_STEPS as usize / 3) + 1,
+            "кадров больше бюджета: {frames}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Крутит `animate(3)`, как окно графа, и считает кадры.
+    fn count_frames_until_settled(graph: &mut GraphView) -> usize {
+        let mut frames = 0;
+        while graph.animate(3) {
+            frames += 1;
+            assert!(frames < 5000, "симуляция не заканчивается");
+        }
+        frames
     }
 
     #[test]

@@ -15,9 +15,8 @@ pub(crate) fn show(ui: &mut egui::Ui, vs: &mut VaultState) -> Option<PathBuf> {
         .default_size([520.0, 420.0])
         .resizable(true)
         .show(ui.ctx(), |ui| {
-            // Граф пересобирается только когда окно действительно видно (C4):
-            // пересканирование vault лишь помечает его «грязным».
-            vs.sync_graph();
+            // Граф пересобирается только пока окно открыто (C3, `refresh_graph`).
+            vs.refresh_graph();
             // Раскладываем, пока симуляция не успокоится; после этого кадры
             // не нужны и процессор свободен.
             if vs.graph.animate(3) {
