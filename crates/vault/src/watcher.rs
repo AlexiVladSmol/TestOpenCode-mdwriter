@@ -5,16 +5,47 @@
 //! файлы атомарной записи), складывает пути изменённых файлов в канал и
 //! будит UI через `on_change`. Приложение забирает накопленное
 //! [`VaultWatcher::take_changes`].
+//!
+//! Режим слежения зависит от ОС ([`WatchMode`]):
+//! - Windows и macOS — одно рекурсивное слежение за корнем: система сама
+//!   следит за всем деревом, новые папки подхватываются автоматически, а
+//!   недоступные подпапки ничего не ломают;
+//! - Linux и прочие — слежение по папкам: рекурсивный режим `notify` на
+//!   inotify обходит все подпапки и обрывается на первой недоступной (G7),
+//!   поэтому папки ставятся на слежение по одной, а **новые папки** —
+//!   по мере появления в [`VaultWatcher::take_changes`] (G7a).
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+/// Как ставится слежение за деревом папок vault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WatchMode {
+    /// Одно `RecursiveMode::Recursive` на корень.
+    Recursive,
+    /// `NonRecursive` на каждую папку; новые папки добавляются по событиям.
+    PerDirectory,
+}
+
+impl WatchMode {
+    /// Режим для текущей ОС.
+    fn for_platform() -> Self {
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            WatchMode::Recursive
+        } else {
+            WatchMode::PerDirectory
+        }
+    }
+}
+
 /// Фоновый наблюдатель за папкой vault.
 pub struct VaultWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     rx: Receiver<Vec<PathBuf>>,
+    root: PathBuf,
+    mode: WatchMode,
     /// Папки, которые не удалось поставить на слежение (обычно нет прав).
     skipped: Vec<String>,
 }
@@ -24,6 +55,14 @@ impl VaultWatcher {
     /// после каждого значимого события — например, чтобы перерисовать окно
     /// (`ctx.request_repaint()`), даже если пользователь ничего не делает.
     pub fn new(root: &Path, on_change: impl Fn() + Send + 'static) -> notify::Result<Self> {
+        Self::with_mode(root, WatchMode::for_platform(), on_change)
+    }
+
+    pub(crate) fn with_mode(
+        root: &Path,
+        mode: WatchMode,
+        on_change: impl Fn() + Send + 'static,
+    ) -> notify::Result<Self> {
         let (tx, rx) = channel::<Vec<PathBuf>>();
         let root_owned = root.to_path_buf();
         let mut watcher =
@@ -40,21 +79,26 @@ impl VaultWatcher {
                     }
                 }
             })?;
-        // `RecursiveMode::Recursive` обрывается на первой недоступной
-        // подпапке (например, на симлинке внутрь `/tmp` из `~/.wine`), и
-        // тогда vault не открывается вовсе. Поэтому ставим слежение сами:
-        // корень обязателен, остальные папки — по одной, недоступные
-        // пропускаем и запоминаем.
-        watcher.watch(root, RecursiveMode::NonRecursive)?;
         let mut skipped = Vec::new();
-        for dir in dirs_to_watch(root) {
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                skipped.push(format!("{}: {e}", dir.display()));
+        match mode {
+            WatchMode::Recursive => watcher.watch(root, RecursiveMode::Recursive)?,
+            WatchMode::PerDirectory => {
+                // Рекурсивный режим на inotify обрывается на первой недоступной
+                // подпапке (например, на симлинке внутрь `/tmp` из `~/.wine`),
+                // и тогда vault не открывается вовсе. Поэтому корень
+                // обязателен, остальные папки — по одной, недоступные
+                // пропускаем и запоминаем.
+                watcher.watch(root, RecursiveMode::NonRecursive)?;
+                for dir in dirs_to_watch(root) {
+                    watch_dir(&mut watcher, &dir, &mut skipped);
+                }
             }
         }
         Ok(Self {
-            _watcher: watcher,
+            watcher,
             rx,
+            root: root.to_path_buf(),
+            mode,
             skipped,
         })
     }
@@ -69,11 +113,54 @@ impl VaultWatcher {
     /// отсортированы. Пустой вектор — изменений не было. Путь, равный корню
     /// vault, означает «изменилось неизвестно что» — нужно полное
     /// пересканирование.
-    pub fn take_changes(&self) -> Vec<PathBuf> {
+    ///
+    /// В режиме слежения по папкам здесь же ставятся на слежение папки,
+    /// появившиеся с прошлого вызова (созданные или перенесённые целиком), а
+    /// всё, что уже лежит внутри них, добавляется в результат: файлы могли
+    /// появиться раньше, чем слежение за папкой успело встать.
+    pub fn take_changes(&mut self) -> Vec<PathBuf> {
         let mut all: Vec<PathBuf> = self.rx.try_iter().flatten().collect();
+        if self.mode == WatchMode::PerDirectory {
+            let new_dirs: Vec<PathBuf> = all
+                .iter()
+                .filter(|p| *p != &self.root && p.is_dir())
+                .cloned()
+                .collect();
+            for dir in new_dirs {
+                self.watch_new_tree(&dir, &mut all);
+            }
+        }
         all.sort();
         all.dedup();
         all
+    }
+
+    /// Ставит на слежение новую папку и её подпапки (кроме скрытых) и
+    /// добавляет в `changes` всё, что внутри уже есть.
+    fn watch_new_tree(&mut self, dir: &Path, changes: &mut Vec<PathBuf>) {
+        if !is_relevant(&self.root, dir) {
+            return;
+        }
+        // Повторная постановка той же папки безопасна: inotify вернёт тот же
+        // дескриптор. Поэтому отдельный список «уже следим» не нужен — и не
+        // устареет, если папку удалят и создадут заново.
+        watch_dir(&mut self.watcher, dir, &mut self.skipped);
+        for sub in dirs_to_watch(dir) {
+            watch_dir(&mut self.watcher, &sub, &mut self.skipped);
+        }
+        let walker = walkdir::WalkDir::new(dir)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| !crate::store::is_hidden(e));
+        changes.extend(walker.flatten().map(|e| e.into_path()));
+    }
+}
+
+/// Ставит одну папку на нерекурсивное слежение; ошибку запоминает в `skipped`.
+fn watch_dir(watcher: &mut RecommendedWatcher, dir: &Path, skipped: &mut Vec<String>) {
+    if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+        skipped.push(format!("{}: {e}", dir.display()));
     }
 }
 
@@ -268,7 +355,8 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let readable = std::fs::read_dir(&locked).is_err();
 
-        let watcher = VaultWatcher::new(dir.path(), || {});
+        // Сценарий G7 — режим по папкам (на Linux он и так по умолчанию).
+        let watcher = VaultWatcher::with_mode(dir.path(), WatchMode::PerDirectory, || {});
         // Вернуть права до проверок, чтобы TempDir смог удалиться.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -296,7 +384,7 @@ mod tests {
 
         let woken = Arc::new(AtomicUsize::new(0));
         let w = Arc::clone(&woken);
-        let watcher = VaultWatcher::new(&dir, move || {
+        let mut watcher = VaultWatcher::new(&dir, move || {
             w.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
@@ -329,5 +417,124 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let _ = watcher.take_changes();
         assert!(watcher.take_changes().is_empty());
+    }
+
+    // ------------- G7a: папки, появившиеся после открытия vault -------------
+
+    /// Копит `take_changes`, пока `done` не выполнится (до 5 с).
+    fn collect_until(w: &mut VaultWatcher, done: impl Fn(&[PathBuf]) -> bool) -> Vec<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            seen.extend(w.take_changes());
+            if done(&seen) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        seen
+    }
+
+    fn has(seen: &[PathBuf], name: &str) -> bool {
+        seen.iter().any(|p| p.ends_with(name))
+    }
+
+    /// Новая папка, файл в ней — до и после того, как приложение заметило
+    /// папку, вложенное дерево, перенесённое целиком, и скрытая папка.
+    fn new_folders_are_watched(mode: WatchMode) {
+        let root = crate::test_support::unique_temp_dir("mdwriter-g7a-");
+        let root = root.canonicalize().unwrap_or(root);
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        let mut w = VaultWatcher::with_mode(&root, mode, || {}).unwrap();
+
+        // 1. Папка создана, приложение её заметило, потом в ней появилась заметка.
+        std::fs::create_dir(root.join("new")).unwrap();
+        collect_until(&mut w, |s| has(s, "new"));
+        std::fs::write(root.join("new").join("b.md"), "b").unwrap();
+        let seen = collect_until(&mut w, |s| has(s, "b.md"));
+        assert!(
+            has(&seen, "b.md"),
+            "{mode:?}: нет события о new/b.md: {seen:?}"
+        );
+
+        // 2. Папка и заметка появились сразу, до любого опроса наблюдателя.
+        std::fs::create_dir(root.join("fast")).unwrap();
+        std::fs::write(root.join("fast").join("c.md"), "c").unwrap();
+        let seen = collect_until(&mut w, |s| has(s, "c.md"));
+        assert!(
+            has(&seen, "c.md"),
+            "{mode:?}: нет события о fast/c.md: {seen:?}"
+        );
+
+        // 3. Дерево перенесено в vault целиком (так делают синхронизация и git).
+        let outside = crate::test_support::unique_temp_dir("mdwriter-g7a-src-");
+        std::fs::create_dir_all(outside.join("sub").join("inner")).unwrap();
+        std::fs::write(outside.join("sub").join("inner").join("d.md"), "d").unwrap();
+        std::fs::rename(&outside, root.join("moved")).unwrap();
+        let seen = collect_until(&mut w, |s| has(s, "d.md") || has(s, "moved"));
+        assert!(
+            has(&seen, "d.md") || has(&seen, "moved"),
+            "{mode:?}: перенос дерева не замечен: {seen:?}"
+        );
+        if mode == WatchMode::PerDirectory {
+            // Здесь содержимое перенесённой папки сообщается явно.
+            let seen = if has(&seen, "d.md") {
+                seen
+            } else {
+                collect_until(&mut w, |s| has(s, "d.md"))
+            };
+            assert!(
+                has(&seen, "d.md"),
+                "содержимое переноса не сообщено: {seen:?}"
+            );
+        }
+        // ...и за вложенными папками перенесённого дерева тоже следим.
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = w.take_changes();
+        let inner = root.join("moved").join("sub").join("inner");
+        std::fs::write(inner.join("e.md"), "e").unwrap();
+        let seen = collect_until(&mut w, |s| has(s, "e.md"));
+        assert!(
+            has(&seen, "e.md"),
+            "{mode:?}: нет события о moved/sub/inner/e.md: {seen:?}"
+        );
+
+        // 4. Скрытая новая папка не сообщается и на слежение не ставится.
+        std::fs::create_dir(root.join(".cache")).unwrap();
+        std::fs::write(root.join(".cache").join("x.md"), "x").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let seen = w.take_changes();
+        assert!(
+            seen.iter().all(|p| is_relevant(&root, p)),
+            "{mode:?}: {seen:?}"
+        );
+        assert!(w.skipped().is_empty(), "{mode:?}: {:?}", w.skipped());
+    }
+
+    /// Рекурсивный режим проверяем только там, где он включается
+    /// (`WatchMode::for_platform`). На Linux `notify` эмулирует его поверх
+    /// inotify и ставит слежение за новой папкой с запаздыванием: файл,
+    /// записанный сразу после `mkdir`, теряется (сценарий 2 падает в CI на
+    /// Ubuntu). Поэтому на Linux приложение использует режим по папкам — его
+    /// тест ниже идёт на всех ОС.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn g7a_new_folders_recursive_mode() {
+        new_folders_are_watched(WatchMode::Recursive);
+    }
+
+    #[test]
+    fn g7a_new_folders_per_directory_mode() {
+        new_folders_are_watched(WatchMode::PerDirectory);
+    }
+
+    #[test]
+    fn g7a_platform_mode() {
+        let expected = if cfg!(any(target_os = "windows", target_os = "macos")) {
+            WatchMode::Recursive
+        } else {
+            WatchMode::PerDirectory
+        };
+        assert_eq!(WatchMode::for_platform(), expected);
     }
 }
