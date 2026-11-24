@@ -28,9 +28,107 @@ pub struct Wikilink {
     pub range: Range<usize>,
 }
 
+/// Цель wikilink, разложенная на путь и якорь: `note#Заголовок` → (`note`, `Заголовок`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTarget<'a> {
+    /// Путь заметки без якоря (может быть пустым для `[[#Заголовок]]`).
+    pub path: &'a str,
+    /// Якорь после первого `#` (заголовок или блок `^id`).
+    pub anchor: Option<&'a str>,
+}
+
+/// Делит цель wikilink по первому `#`.
+pub fn parse_link_target(raw: &str) -> LinkTarget<'_> {
+    match raw.split_once('#') {
+        Some((path, anchor)) => LinkTarget {
+            path: path.trim(),
+            anchor: Some(anchor.trim()),
+        },
+        None => LinkTarget {
+            path: raw.trim(),
+            anchor: None,
+        },
+    }
+}
+
+/// Общие опции pulldown-cmark для предпросмотра и экспорта.
+pub fn cmark_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
+    options.insert(Options::ENABLE_MATH);
+    options
+}
+
+/// Строка-«ограда» блока кода (```` ``` ```` или `~~~`, с любым отступом).
+pub fn is_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// Заменяет `[[target|alias]]` на `[alias](<url(target)>)` в тексте вне кода.
+///
+/// Угловые скобки вокруг адреса нужны, чтобы ссылки с пробелами оставались
+/// ссылками по CommonMark. Ссылки с `<`, `>` или переводом строки в цели
+/// остаются исходным текстом.
+pub fn wikilinks_to_md(text: &str, url: impl Fn(&str) -> String) -> String {
+    let links = extract_wikilinks(text);
+    if links.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for w in links {
+        out.push_str(&text[last..w.range.start]);
+        match wikilink_md(&w, &url) {
+            Some(md) => out.push_str(&md),
+            None => out.push_str(&text[w.range.clone()]),
+        }
+        last = w.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Одна wikilink в виде markdown-ссылки; `None`, если цель нельзя положить
+/// в адрес (содержит `<`, `>` или перевод строки).
+fn wikilink_md(w: &Wikilink, url: &impl Fn(&str) -> String) -> Option<String> {
+    if w.target.contains(['<', '>', '\n', '\r']) {
+        return None;
+    }
+    let label = w.alias.as_deref().unwrap_or(&w.target);
+    Some(format!(
+        "[{}](<{}>)",
+        escape_link_label(label),
+        url(&w.target)
+    ))
+}
+
+/// Экранирует символы, ломающие текст ссылки: `\`, `[`, `]`.
+fn escape_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Отделяет frontmatter от тела документа.
 /// Возвращает `None`, если документ не начинается с закрытой YAML-шапки.
+///
+/// Поддерживается: UTF-8 BOM в начале файла, парные кавычки вокруг значений,
+/// теги в виде `tags: a, b`, `tags: [a, b]`, многострочного списка
+/// (`tags:` + строки `  - a`), а также одиночного ключа `tag`.
 pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
+    // BOM от редакторов Windows не должен мешать распознать шапку.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut iter = text.split_inclusive('\n');
     let first = iter.next()?;
     if first.trim() != "---" {
@@ -40,6 +138,8 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
     let mut fm = Frontmatter::default();
     let mut consumed = first.len();
     let mut closed = false;
+    // Последний ключ верхнего уровня — к нему относятся строки-продолжения списка.
+    let mut last_key: Option<String> = None;
     for line in iter {
         if line.trim() == "---" {
             consumed += line.len();
@@ -48,22 +148,37 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
         }
         consumed += line.len();
         let line = line.trim_end_matches(['\n', '\r']);
+
+        // Строка-продолжение YAML-списка: `  - значение`.
+        if let Some(item) = list_item(line) {
+            let item = unquote(item);
+            if !item.is_empty() {
+                if let Some(key) = last_key.as_deref() {
+                    if is_tags_key(key) {
+                        push_tag(&mut fm.tags, &item);
+                    }
+                }
+            }
+            continue;
+        }
+
         if let Some((k, v)) = line.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
+            let k = k.trim();
+            let v = v.trim();
             if k.is_empty() {
                 continue;
             }
+            let value = unquote(v);
             if k == "title" {
-                fm.title = Some(v.to_string());
+                fm.title = Some(value.clone());
             }
-            if k == "tags" {
-                fm.tags = v
-                    .split(',')
-                    .map(|s| s.trim().trim_start_matches('#').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+            if is_tags_key(k) {
+                for tag in parse_tag_value(v) {
+                    push_tag(&mut fm.tags, &tag);
+                }
             }
-            fm.pairs.push((k.to_string(), v.to_string()));
+            fm.pairs.push((k.to_string(), value));
+            last_key = Some(k.to_string());
         }
     }
 
@@ -71,6 +186,57 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
         Some((fm, &text[consumed..]))
     } else {
         None
+    }
+}
+
+/// Снимает парные кавычки (`"…"` / `'…'`) вокруг значения.
+fn unquote(value: &str) -> String {
+    let v = value.trim();
+    for q in ['"', '\''] {
+        if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
+            return v[1..v.len() - 1].to_string();
+        }
+    }
+    v.to_string()
+}
+
+/// `tag` и `tags` — оба задают теги заметки.
+fn is_tags_key(key: &str) -> bool {
+    key == "tags" || key == "tag"
+}
+
+/// Строка-продолжение списка: отступ + `- значение`.
+fn list_item(line: &str) -> Option<&str> {
+    let indented = line.starts_with(' ') || line.starts_with('\t');
+    if !indented {
+        return None;
+    }
+    let rest = line.trim_start().strip_prefix('-')?;
+    Some(rest.trim())
+}
+
+/// Теги из значения: `a, b`, `[a, b]`, `#a` (с необязательным `#`).
+fn parse_tag_value(value: &str) -> Vec<String> {
+    let v = value.trim();
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(v);
+    inner
+        .split(',')
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Добавляет тег, отбрасывая `#` и дубликаты (порядок — первое появление).
+fn push_tag(tags: &mut Vec<String>, raw: &str) {
+    let tag = raw.trim().trim_start_matches('#');
+    if tag.is_empty() {
+        return;
+    }
+    if !tags.iter().any(|t| t == tag) {
+        tags.push(tag.to_string());
     }
 }
 
@@ -149,8 +315,7 @@ fn for_each_text_run(text: &str, mut f: impl FnMut(&str, usize)) {
         let line = raw_line.trim_end_matches(['\n', '\r']);
         let line_offset = offset;
 
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if is_fence_line(line) {
             // Упрощение: любая строка-«ограда» переключает состояние.
             in_fence = !in_fence;
         } else if !in_fence {
@@ -264,6 +429,48 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_bom_is_skipped() {
+        let text = "\u{FEFF}---\ntitle: X\n---\nBody\n";
+        let (fm, body) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.title.as_deref(), Some("X"));
+        assert_eq!(body, "Body\n");
+    }
+
+    #[test]
+    fn frontmatter_strips_paired_quotes() {
+        let text = "---\ntitle: \"Заметка\"\nalias: 'одинарные'\nplain: без кавычек\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.title.as_deref(), Some("Заметка"));
+        assert_eq!(fm.pairs[1], ("alias".to_string(), "одинарные".to_string()));
+        assert_eq!(
+            fm.pairs[2],
+            ("plain".to_string(), "без кавычек".to_string())
+        );
+    }
+
+    #[test]
+    fn frontmatter_tags_square_brackets() {
+        let text = "---\ntags: [a, \"b c\", #d]\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["a", "b c", "d"]);
+    }
+
+    #[test]
+    fn frontmatter_tags_multiline_list() {
+        let text = "---\ntitle: T\ntags:\n  - a\n  - \"b c\"\n---\nBody";
+        let (fm, body) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["a", "b c"]);
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn frontmatter_tag_singular_key() {
+        let text = "---\ntag: одиночный\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["одиночный"]);
+    }
+
+    #[test]
     fn wikilinks_basic() {
         let text = "См. [[Заметка]] и [[Другая|алиас]].";
         let links = extract_wikilinks(text);
@@ -302,7 +509,8 @@ mod tests {
 
     #[test]
     fn wikilinks_skip_code() {
-        let text = "[[вне]]\n\n```\n[[внутри огряды]]\n```\n\n`[[в инлайн-коде]]` и [[снова вне]]\n";
+        let text =
+            "[[вне]]\n\n```\n[[внутри огряды]]\n```\n\n`[[в инлайн-коде]]` и [[снова вне]]\n";
         let links = extract_wikilinks(text);
         let targets: Vec<_> = links.iter().map(|w| w.target.as_str()).collect();
         assert_eq!(targets, vec!["вне", "снова вне"]);
@@ -325,5 +533,96 @@ mod tests {
         let text = "#снаружи\n\n```\n#внутри\n```\n\n`#винлайн`\n";
         let tags = extract_tags(text);
         assert_eq!(tags, vec!["снаружи"]);
+    }
+
+    #[test]
+    fn fence_detector_matches_backticks_and_tildes() {
+        assert!(is_fence_line("```"));
+        assert!(is_fence_line("```rust"));
+        assert!(is_fence_line("  ~~~"));
+        assert!(!is_fence_line("текст ``` внутри"));
+        assert!(!is_fence_line(""));
+    }
+
+    #[test]
+    fn cmark_options_enable_gfm_extensions() {
+        let options = cmark_options();
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_TASKLISTS));
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_TABLES));
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_GFM));
+    }
+
+    #[test]
+    fn wikilinks_to_md_uses_callback_url() {
+        let md = wikilinks_to_md(
+            "См. [[Заметка]] и [[Другая|алиас]].",
+            |t| format!("wiki:{t}"),
+        );
+        assert_eq!(
+            md,
+            "См. [Заметка](<wiki:Заметка>) и [алиас](<wiki:Другая>)."
+        );
+    }
+
+    #[test]
+    fn wikilinks_to_md_label_escapes_brackets() {
+        // Алиас со скобкой нельзя получить из текста (extract_wikilinks закрывает
+        // ссылку на первом `]]`), поэтому проверяем сборку ссылки напрямую.
+        let w = Wikilink {
+            target: "Цель".into(),
+            alias: Some("алиас с ] скобкой".into()),
+            embed: false,
+            range: 0..0,
+        };
+        assert_eq!(
+            wikilink_md(&w, &|t: &str| format!("wiki:{t}")).unwrap(),
+            "[алиас с \\] скобкой](<wiki:Цель>)"
+        );
+    }
+
+    #[test]
+    fn wikilinks_to_md_keeps_angle_bracket_targets() {
+        let md = wikilinks_to_md("[[a<b]] и [[ok]]", |t| format!("wiki:{t}"));
+        assert!(md.starts_with("[[a<b]] и "));
+    }
+
+    #[test]
+    fn parse_link_target_with_anchor() {
+        assert_eq!(
+            parse_link_target("note#Заголовок"),
+            LinkTarget {
+                path: "note",
+                anchor: Some("Заголовок"),
+            }
+        );
+        assert_eq!(
+            parse_link_target("note#^block"),
+            LinkTarget {
+                path: "note",
+                anchor: Some("^block"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_link_target_anchor_only() {
+        assert_eq!(
+            parse_link_target("#Заголовок"),
+            LinkTarget {
+                path: "",
+                anchor: Some("Заголовок"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_link_target_without_anchor() {
+        assert_eq!(
+            parse_link_target("note"),
+            LinkTarget {
+                path: "note",
+                anchor: None,
+            }
+        );
     }
 }

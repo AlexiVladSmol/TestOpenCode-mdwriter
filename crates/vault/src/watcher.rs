@@ -15,13 +15,12 @@ pub struct VaultWatcher {
 impl VaultWatcher {
     pub fn new(root: &Path) -> notify::Result<Self> {
         let (tx, rx) = channel::<()>();
-        let mut watcher = notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if res.is_ok() {
                     let _ = tx.send(());
                 }
-            },
-        )?;
+            })?;
         watcher.watch(root, RecursiveMode::Recursive)?;
         Ok(Self {
             _watcher: watcher,

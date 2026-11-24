@@ -9,7 +9,7 @@ use std::iter::Peekable;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Margin, RichText, Stroke, TextStyle, Ui};
-use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 
 /// Действие, которое пользователь запросил в предпросмотре.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
         render_frontmatter(ui, fm);
     }
 
-    let body = wiki_links_to_md(body);
+    let body = wiki_to_md(body);
     let task_lines = collect_task_lines(&body);
     let mut task_counter = 0usize;
     let mut block_counter = 0usize;
@@ -48,22 +48,10 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
     actions
 }
 
-/// Заменяет `[[target|alias]]` на `[alias](wiki:target)` в тексте вне кода.
-fn wiki_links_to_md(text: &str) -> String {
-    let links = markdown::extract_wikilinks(text);
-    if links.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for w in links {
-        out.push_str(&text[last..w.range.start]);
-        let label = w.alias.as_deref().unwrap_or(&w.target);
-        out.push_str(&format!("[{label}](wiki:{})", w.target));
-        last = w.range.end;
-    }
-    out.push_str(&text[last..]);
-    out
+/// Заменяет `[[target|alias]]` на `[alias](<wiki:target>)` в тексте вне кода.
+/// Сама сборка ссылки живёт в крейте `markdown` (общая с экспортом).
+fn wiki_to_md(text: &str) -> String {
+    markdown::wikilinks_to_md(text, |target| format!("wiki:{target}"))
 }
 
 /// Строки-задачи (`- [ ]`, `* [x]`, `1. [ ]` и т.п.) вне огороженных блоков.
@@ -73,7 +61,7 @@ fn collect_task_lines(body: &str) -> Vec<usize> {
     let mut in_fence = false;
     for (i, raw) in body.lines().enumerate() {
         let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if markdown::is_fence_line(raw) {
             in_fence = !in_fence;
             continue;
         }
@@ -130,14 +118,7 @@ fn render_body(
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
-    options.insert(Options::ENABLE_MATH);
-    let parser = Parser::new_ext(md, options);
+    let parser = Parser::new_ext(md, markdown::cmark_options());
     render_blocks(
         ui,
         &mut parser.peekable(),
@@ -413,14 +394,7 @@ fn render_item(
             }
             Some(Event::Start(_)) => {
                 ui.indent("nested", |ui| {
-                    render_block_once(
-                        ui,
-                        events,
-                        task_lines,
-                        task_counter,
-                        block_counter,
-                        actions,
-                    )
+                    render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
                 });
             }
             Some(_) => {
@@ -506,14 +480,7 @@ fn render_quote_content(
                 break;
             }
             Some(Event::Start(_)) => {
-                render_block_once(
-                    ui,
-                    events,
-                    task_lines,
-                    task_counter,
-                    block_counter,
-                    actions,
-                )
+                render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
             }
             Some(_) => {
                 events.next();
@@ -532,10 +499,8 @@ fn render_math_block(ui: &mut Ui, formula: &str) {
         .show(ui, |ui| {
             ui.centered_and_justified(|ui| {
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(formula).monospace().italics().color(color),
-                    )
-                    .selectable(false),
+                    egui::Label::new(RichText::new(formula).monospace().italics().color(color))
+                        .selectable(false),
                 );
             });
         });
@@ -590,11 +555,7 @@ fn render_codeblock(
         });
 }
 
-fn render_table(
-    ui: &mut Ui,
-    events: &mut Peekable<Parser<'_>>,
-    block_counter: &mut usize,
-) {
+fn render_table(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, block_counter: &mut usize) {
     let block_n = *block_counter;
     *block_counter += 1;
     // Собираем строки: (заголовок?, ячейки)
@@ -642,23 +603,23 @@ fn render_table(
             egui::ScrollArea::horizontal()
                 .id_salt(("md_table", block_n))
                 .show(ui, |ui| {
-                egui::Grid::new("md_table")
-                    .striped(true)
-                    .min_col_width(60.0)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        for (is_head, cells) in &rows {
-                            for cell in cells {
-                                if *is_head {
-                                    ui.strong(cell);
-                                } else {
-                                    ui.label(cell);
+                    egui::Grid::new("md_table")
+                        .striped(true)
+                        .min_col_width(60.0)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for (is_head, cells) in &rows {
+                                for cell in cells {
+                                    if *is_head {
+                                        ui.strong(cell);
+                                    } else {
+                                        ui.label(cell);
+                                    }
                                 }
+                                ui.end_row();
                             }
-                            ui.end_row();
-                        }
-                    });
-            });
+                        });
+                });
         });
 }
 
@@ -690,13 +651,15 @@ struct LinkRange {
 fn is_block_start(ev: &Event<'_>) -> bool {
     matches!(
         ev,
-        Event::Start(Tag::List(_)
-            | Tag::BlockQuote(_)
-            | Tag::CodeBlock(_)
-            | Tag::Table(_)
-            | Tag::Heading { .. }
-            | Tag::FootnoteDefinition(_)
-            | Tag::HtmlBlock)
+        Event::Start(
+            Tag::List(_)
+                | Tag::BlockQuote(_)
+                | Tag::CodeBlock(_)
+                | Tag::Table(_)
+                | Tag::Heading { .. }
+                | Tag::FootnoteDefinition(_)
+                | Tag::HtmlBlock
+        )
     )
 }
 
@@ -766,12 +729,7 @@ fn render_inline_with(
 }
 
 /// Рисует LayoutJob и обрабатывает клики по wikilinks внутри него.
-fn render_job(
-    ui: &mut Ui,
-    job: LayoutJob,
-    links: &[LinkRange],
-    actions: &mut Vec<Action>,
-) {
+fn render_job(ui: &mut Ui, job: LayoutJob, links: &[LinkRange], actions: &mut Vec<Action>) {
     let response = ui.label(job.clone());
     if !links.is_empty() && response.clicked() {
         let galley = ui.fonts_mut(|f| f.layout_job(job));
@@ -999,22 +957,52 @@ mod tests {
 
     #[test]
     fn wiki_links_transformed() {
-        let md = wiki_links_to_md("См. [[Заметка]] и [[Другая|алиас]].");
-        assert_eq!(md, "См. [Заметка](wiki:Заметка) и [алиас](wiki:Другая).");
+        let md = wiki_to_md("См. [[Заметка]] и [[Другая|алиас]].");
+        assert_eq!(
+            md,
+            "См. [Заметка](<wiki:Заметка>) и [алиас](<wiki:Другая>)."
+        );
+    }
+
+    /// Адреса ссылок, которые реально видит парсер markdown.
+    fn link_dests(md: &str) -> Vec<String> {
+        Parser::new_ext(md, markdown::cmark_options())
+            .filter_map(|e| match e {
+                Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wiki_links_with_spaces_are_real_links() {
+        let md = wiki_to_md("См. [[Моя заметка]].");
+        assert_eq!(link_dests(&md), vec!["wiki:Моя заметка"]);
+    }
+
+    #[test]
+    fn wiki_link_target_with_anchor() {
+        let md = wiki_to_md("[[Моя заметка#Заголовок]]");
+        assert_eq!(link_dests(&md), vec!["wiki:Моя заметка#Заголовок"]);
+    }
+
+    #[test]
+    fn wiki_link_with_angle_brackets_is_kept_as_text() {
+        let md = wiki_to_md("[[a<b]] и [[ok]]");
+        assert!(md.starts_with("[[a<b]] и "));
+        assert_eq!(link_dests(&md).len(), 1);
     }
 
     #[test]
     fn wiki_links_untouched_in_code() {
-        let md = wiki_links_to_md("`[[не ссылка]]`");
+        let md = wiki_to_md("`[[не ссылка]]`");
         assert_eq!(md, "`[[не ссылка]]`");
     }
 
     #[test]
     fn ordered_task_list_marker() {
         let md = "1. [ ] один\n2. [x] два\n- [ ] три\n";
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TASKLISTS);
-        let parser = Parser::new_ext(md, options);
+        let parser = Parser::new_ext(md, markdown::cmark_options());
         let markers: Vec<bool> = parser
             .filter_map(|e| match e {
                 Event::TaskListMarker(b) => Some(b),
@@ -1026,7 +1014,8 @@ mod tests {
 
     #[test]
     fn collect_task_lines_basic() {
-        let body = "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
+        let body =
+            "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
         let lines = collect_task_lines(body);
         assert_eq!(lines, vec![0, 1, 2]);
     }
@@ -1034,9 +1023,7 @@ mod tests {
     #[test]
     fn tables_parse() {
         let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TABLES);
-        let parser = Parser::new_ext(md, options);
+        let parser = Parser::new_ext(md, markdown::cmark_options());
         let tags: Vec<_> = parser
             .filter_map(|e| match e {
                 Event::Start(t) => Some(t),

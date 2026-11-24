@@ -625,12 +625,16 @@ impl VaultState {
     /// Для выхода из приложения и смены vault: сохраняет правки, а если
     /// мешает конфликт или удалённый файл — пишет копию, чтобы ничего
     /// не потерять.
-    #[allow(dead_code)] // вызывается из on_exit/open_vault после слияния A1
     fn flush_or_copy(&mut self) -> Result<(), String> {
         if self.dirty && (self.conflict || self.orphaned) {
             return self.save_copy().map(|_| ());
         }
-        self.flush()
+        match self.flush() {
+            Ok(()) => Ok(()),
+            // Запись не удалась (или flush сам обнаружил конфликт) — копия.
+            Err(e) if self.dirty => self.save_copy().map(|_| ()).map_err(|_| e),
+            Err(e) => Err(e),
+        }
     }
 
     fn maybe_autosave(&mut self, now: f64, ctx: &egui::Context) {
@@ -685,13 +689,8 @@ impl VaultState {
                 if let Some(rel) = self.index.resolve_wikilink(&from, target) {
                     return Some(rel);
                 }
-                let name = if target.ends_with(".md") {
-                    target.to_string()
-                } else {
-                    format!("{target}.md")
-                };
-                let dir = from.parent().unwrap_or(Path::new(""));
-                let rel = dir.join(name);
+                // Якорь (`#…`) в имя файла не попадает; `[[#Заголовок]]` ничего не создаёт.
+                let rel = new_note_path(&from, target)?;
                 match self.vault.create(&rel) {
                     Ok(()) => {
                         self.rescan();
@@ -1088,6 +1087,17 @@ impl App {
 
     fn open_vault(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            // Перед сменой vault дописываем несохранённую заметку старого vault.
+            // Если сохранить не удалось ни в файл, ни копией — остаёмся,
+            // иначе правки пропадут вместе со старым VaultState.
+            if let Some(vs) = &mut self.vault {
+                if vs.flush_or_copy().is_err() {
+                    self.notices.error(
+                        "Vault не сменён: не удалось сохранить открытую заметку".to_string(),
+                    );
+                    return;
+                }
+            }
             match VaultWatcher::new(&path) {
                 Ok(watcher) => {
                     let mut vs =
@@ -1129,7 +1139,7 @@ impl App {
             self.settings.window_size = Some(size);
         }
 
-        if self.settings_dirty {
+        if should_save_settings(self.settings_dirty, ctx.input(|i| i.pointer.any_down())) {
             self.save_settings();
         }
     }
@@ -1141,7 +1151,8 @@ impl App {
         }
         match serde_json::to_string_pretty(&self.settings) {
             Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
+                // Атомарная запись: оборванная запись не оставит битый JSON.
+                if let Err(e) = vault::store::atomic_write(&path, s.as_bytes()) {
                     self.notices
                         .error(format!("Не удалось сохранить настройки: {e}"));
                 }
@@ -1152,6 +1163,12 @@ impl App {
         }
         self.settings_dirty = false;
     }
+}
+
+/// Нужно ли писать настройки в этом кадре: только при изменениях и не во время
+/// перетаскивания (иначе разделитель панели пишет файл в каждом кадре).
+fn should_save_settings(settings_dirty: bool, pointer_down: bool) -> bool {
+    settings_dirty && !pointer_down
 }
 
 impl App {
@@ -1199,13 +1216,7 @@ impl App {
             return;
         };
 
-        let mut options = pulldown_cmark::Options::empty();
-        options.insert(pulldown_cmark::Options::ENABLE_TABLES);
-        options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
-        options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-        options.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
-        options.insert(pulldown_cmark::Options::ENABLE_GFM);
-        options.insert(pulldown_cmark::Options::ENABLE_MATH);
+        let options = markdown::cmark_options();
 
         let mut html = String::from(
             "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>",
@@ -1232,6 +1243,22 @@ impl App {
                 .error(format!("Не удалось записать {}: {e}", path.display())),
         }
     }
+}
+
+/// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),
+/// `None` — если путь пустой (`[[#Заголовок]]`), создавать нечего.
+fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
+    let markdown::LinkTarget { path, .. } = markdown::parse_link_target(raw);
+    if path.is_empty() {
+        return None;
+    }
+    let name = if path.to_lowercase().ends_with(".md") {
+        path.to_string()
+    } else {
+        format!("{path}.md")
+    };
+    let dir = from.parent().unwrap_or(Path::new(""));
+    Some(dir.join(name))
 }
 
 /// Текущая дата (UTC) в формате `ГГГГ-ММ-ДД`.
@@ -1904,6 +1931,11 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Текст, набранный за последнюю секунду (AUTOSAVE_DELAY), иначе теряется.
+        // При конфликте или ошибке записи правки уходят в копию рядом с заметкой.
+        if let Some(vs) = &mut self.vault {
+            let _ = vs.flush_or_copy();
+        }
         self.save_settings();
     }
 }
@@ -1911,6 +1943,32 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_saved_only_when_dirty_and_not_dragging() {
+        assert!(should_save_settings(true, false));
+        // Пока зажата кнопка мыши (перетаскивание разделителя) не пишем.
+        assert!(!should_save_settings(true, true));
+        assert!(!should_save_settings(false, false));
+        assert!(!should_save_settings(false, true));
+    }
+
+    #[test]
+    fn new_note_path_uses_path_without_anchor() {
+        let from = Path::new("sub/cur.md");
+        assert_eq!(
+            new_note_path(from, "Note#Заголовок"),
+            Some(PathBuf::from("sub/Note.md"))
+        );
+        assert_eq!(
+            new_note_path(from, "Note#^block"),
+            Some(PathBuf::from("sub/Note.md"))
+        );
+        // Расширение не дублируется, регистр не важен.
+        assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
+        // Только якорь — создавать нечего.
+        assert_eq!(new_note_path(from, "#Только якорь"), None);
+    }
 
     #[test]
     fn lines_range_does_not_panic_on_utf8() {
@@ -2086,6 +2144,20 @@ mod tests {
         vs.rescan();
         vs.flush_or_copy().unwrap();
         assert_eq!(disk(&dir), "чужие");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a (конфликт).md")).unwrap(),
+            "мои"
+        );
+    }
+
+    #[test]
+    fn g4_flush_or_copy_falls_back_to_copy_on_write_error() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        // Вместо файла заметки — каталог: и чтение, и запись падают.
+        std::fs::remove_file(dir.join("a.md")).unwrap();
+        std::fs::create_dir(dir.join("a.md")).unwrap();
+        vs.flush_or_copy().unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("a (конфликт).md")).unwrap(),
             "мои"

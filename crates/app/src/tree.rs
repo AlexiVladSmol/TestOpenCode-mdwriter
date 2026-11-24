@@ -6,8 +6,14 @@ use eframe::egui;
 
 #[derive(Debug, Clone)]
 pub enum TreeNode {
-    Dir { name: String, children: Vec<TreeNode> },
-    File { name: String, rel: PathBuf },
+    Dir {
+        name: String,
+        children: Vec<TreeNode>,
+    },
+    File {
+        name: String,
+        rel: PathBuf,
+    },
 }
 
 impl TreeNode {
@@ -87,11 +93,7 @@ pub fn show_tree(
     clicked
 }
 
-fn show_node(
-    ui: &mut egui::Ui,
-    node: &TreeNode,
-    selected: &Option<PathBuf>,
-) -> Option<PathBuf> {
+fn show_node(ui: &mut egui::Ui, node: &TreeNode, selected: &Option<PathBuf>) -> Option<PathBuf> {
     match node {
         TreeNode::Dir { name, children } => {
             let mut clicked = None;
