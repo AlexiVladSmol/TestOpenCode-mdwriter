@@ -50,7 +50,10 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
     actions
 }
 
-/// Заменяет `[[target|alias]]` на `[alias](wiki:target)` в тексте вне кода.
+/// Заменяет `[[target|alias]]` на `[alias](<wiki:target>)` в тексте вне кода.
+/// Угловые скобки вокруг адреса нужны, чтобы ссылки с пробелами оставались
+/// ссылками по CommonMark. Ссылки с `<`, `>` или переводом строки в цели
+/// остаются исходным текстом.
 fn wiki_links_to_md(text: &str) -> String {
     let links = markdown::extract_wikilinks(text);
     if links.is_empty() {
@@ -60,11 +63,39 @@ fn wiki_links_to_md(text: &str) -> String {
     let mut last = 0;
     for w in links {
         out.push_str(&text[last..w.range.start]);
-        let label = w.alias.as_deref().unwrap_or(&w.target);
-        out.push_str(&format!("[{label}](wiki:{})", w.target));
+        match wiki_link_md(&w) {
+            Some(md) => out.push_str(&md),
+            None => out.push_str(&text[w.range.clone()]),
+        }
         last = w.range.end;
     }
     out.push_str(&text[last..]);
+    out
+}
+
+/// Одна wikilink в виде markdown-ссылки; `None`, если цель нельзя положить
+/// в адрес (содержит `<`, `>` или перевод строки).
+fn wiki_link_md(w: &markdown::Wikilink) -> Option<String> {
+    if w.target.contains(['<', '>', '\n', '\r']) {
+        return None;
+    }
+    let label = w.alias.as_deref().unwrap_or(&w.target);
+    Some(format!(
+        "[{}](<wiki:{}>)",
+        escape_link_label(label),
+        w.target
+    ))
+}
+
+/// Экранирует символы, ломающие текст ссылки: `\`, `[`, `]`.
+fn escape_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -979,7 +1010,56 @@ mod tests {
     #[test]
     fn wiki_links_transformed() {
         let md = wiki_links_to_md("См. [[Заметка]] и [[Другая|алиас]].");
-        assert_eq!(md, "См. [Заметка](wiki:Заметка) и [алиас](wiki:Другая).");
+        assert_eq!(
+            md,
+            "См. [Заметка](<wiki:Заметка>) и [алиас](<wiki:Другая>)."
+        );
+    }
+
+    /// Адреса ссылок, которые реально видит парсер markdown.
+    fn link_dests(md: &str) -> Vec<String> {
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_TABLES);
+        options.insert(Options::ENABLE_TASKLISTS);
+        Parser::new_ext(md, options)
+            .filter_map(|e| match e {
+                Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wiki_links_with_spaces_are_real_links() {
+        let md = wiki_links_to_md("См. [[Моя заметка]].");
+        assert_eq!(link_dests(&md), vec!["wiki:Моя заметка"]);
+    }
+
+    #[test]
+    fn wiki_link_label_escapes_brackets() {
+        let w = markdown::Wikilink {
+            target: "Цель".into(),
+            alias: Some("алиас с ] скобкой".into()),
+            embed: false,
+            range: 0..0,
+        };
+        assert_eq!(
+            wiki_link_md(&w).unwrap(),
+            "[алиас с \\] скобкой](<wiki:Цель>)"
+        );
+    }
+
+    #[test]
+    fn wiki_link_target_with_anchor() {
+        let md = wiki_links_to_md("[[Моя заметка#Заголовок]]");
+        assert_eq!(link_dests(&md), vec!["wiki:Моя заметка#Заголовок"]);
+    }
+
+    #[test]
+    fn wiki_link_with_angle_brackets_is_kept_as_text() {
+        let md = wiki_links_to_md("[[a<b]] и [[ok]]");
+        assert!(md.starts_with("[[a<b]] и "));
+        assert_eq!(link_dests(&md).len(), 1);
     }
 
     #[test]
