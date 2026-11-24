@@ -987,7 +987,7 @@ mod tests {
     }
 
     /// Замер «до/после» (не входит в обычный прогон):
-    /// `cargo test -p index --release -- --ignored --nocapture c1_timing`
+    /// `cargo test -p mdwriter-index --release -- --ignored --nocapture c1_timing`
     #[test]
     #[ignore]
     fn c1_timing() {
