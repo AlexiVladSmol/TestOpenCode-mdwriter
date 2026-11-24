@@ -1,12 +1,13 @@
 [package]
-name = "graph"
+name = "mdwriter-graph"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 egui.workspace = true
-index = { path = "../index" }
+index = { package = "mdwriter-index", path = "../index" }
 petgraph.workspace = true

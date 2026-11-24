@@ -1,13 +1,14 @@
 [package]
-name = "preview"
+name = "mdwriter-preview"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 egui.workspace = true
 egui_extras.workspace = true
-markdown = { path = "../markdown" }
+markdown = { package = "mdwriter-markdown", path = "../markdown" }
 pulldown-cmark.workspace = true

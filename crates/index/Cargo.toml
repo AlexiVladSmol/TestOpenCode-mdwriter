@@ -1,11 +1,12 @@
 [package]
-name = "index"
+name = "mdwriter-index"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
-markdown = { path = "../markdown" }
-vault = { path = "../vault" }
+markdown = { package = "mdwriter-markdown", path = "../markdown" }
+vault = { package = "mdwriter-vault", path = "../vault" }
