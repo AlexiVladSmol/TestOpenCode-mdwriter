@@ -92,7 +92,7 @@
 | D4 | P3 | Переименовать крейты в `mdwriter-*`, `publish = false` | — | DeepSeek | 4 | [ ] |
 | E1 | P1 | CI: fmt + clippy + test на Windows и Linux | — | DeepSeek | 0 | [x] |
 | E2 | P2 | Указать `rust-version` | — | DeepSeek | 4 | [ ] |
-| E3 | P3 | Почистить `.gitignore` | — | DeepSeek | 0 | [ ] |
+| E3 | P3 | Почистить `.gitignore` | — | DeepSeek | 0 | [x] |
 | E4 | P2 | Актуализировать `PLAN.md` и README | после фаз A–C | DeepSeek | 5 | [ ] |
 | F* | P3 | Новые функции (по желанию) | всё выше | — | 6 | [ ] |
 
