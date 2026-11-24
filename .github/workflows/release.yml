@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: ver
+        run: |
+          v=$(cargo metadata --format-version 1 --no-deps --locked \
+              | jq -r '.packages[] | select(.name == "mdwriter") | .version')
+          echo "ver=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p mdwriter
+
+      - name: Package
+        env:
+          VER: ${{ steps.ver.outputs.ver }}
+        run: |
+          set -eux
+          name="mdwriter-${VER}-linux-x86_64"
+          mkdir -p "stage/${name}" out
+          cp target/release/mdwriter "stage/${name}/"
+          strip "stage/${name}/mdwriter"
+          cp README.md LICENSE "stage/${name}/"
+          tar -C stage -czf "out/${name}.tar.gz" "${name}"
+          ( cd out && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          tar -tzvf "out/${name}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          v=$(cargo metadata --format-version 1 --no-deps --locked \
+              | jq -r '.packages[] | select(.name == "mdwriter") | .version')
+          echo "ver=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked -p mdwriter
+
+      - name: Package
+        shell: pwsh
+        env:
+          VER: ${{ steps.ver.outputs.ver }}
+        run: |
+          $name = "mdwriter-$env:VER-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "stage/$name", "out" | Out-Null
+          Copy-Item target/release/mdwriter.exe "stage/$name/"
+          Copy-Item README.md, LICENSE "stage/$name/"
+          Compress-Archive -Path "stage/$name" -DestinationPath "out/$name.zip"
+          $hash = (Get-FileHash "out/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "out/$name.zip.sha256" -Value "$hash  $name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -eux
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          ls -lh
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mdwriter $TAG" \
+            --generate-notes \
+            --verify-tag \
+            --latest
