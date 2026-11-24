@@ -466,7 +466,8 @@ impl eframe::App for App {
                     ui.separator();
 
                     if !vs.search_query.is_empty() {
-                        let results = vs.index.search(&vs.search_query, 30);
+                        // Кеш внутри: пересчёт только при смене запроса/индекса.
+                        let results = vs.search_results(30);
                         egui::ScrollArea::vertical()
                             .id_salt("search_list")
                             .auto_shrink([false, false])

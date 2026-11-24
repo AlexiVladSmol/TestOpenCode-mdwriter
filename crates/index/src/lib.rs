@@ -356,25 +356,31 @@ impl Index {
 
     /// Полнотекстовый поиск: (путь, сниппет с контекстом).
     pub fn search(&self, query: &str, limit: usize) -> Vec<(PathBuf, String)> {
-        let q = query.to_lowercase();
-        let mut out = Vec::new();
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        // (совпадение в заголовке, путь, сниппет)
+        let mut hits: Vec<(bool, PathBuf, String)> = Vec::new();
         for (rel, text) in &self.contents {
             let title_hit = self
                 .notes
                 .get(rel)
-                .map(|m| m.title.to_lowercase().contains(&q))
+                .map(|m| find_ci(&m.title, &q).is_some())
                 .unwrap_or(false);
-            if let Some(pos) = text
-                .to_lowercase()
-                .find(&q)
-                .or_else(|| title_hit.then_some(0))
-            {
-                out.push((rel.clone(), snippet(text, pos, q.len())));
-            }
+            // Позиция — из `find_ci`, то есть уже в исходном тексте (C2).
+            let body = find_ci(text, &q);
+            let snippet_text = match body {
+                Some(range) => snippet(text, range.start, range.len()),
+                None if title_hit => snippet(text, 0, 0),
+                None => continue,
+            };
+            hits.push((title_hit, rel.clone(), snippet_text));
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.truncate(limit);
-        out
+        // Совпадение в заголовке — выше, дальше по пути.
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        hits.truncate(limit);
+        hits.into_iter().map(|(_, rel, text)| (rel, text)).collect()
     }
 }
 
@@ -387,6 +393,43 @@ fn default_title(rel: &Path) -> String {
 /// Ключ для сравнения путей без учёта регистра: `\` → `/`, нижний регистр.
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+/// Регистронезависимый поиск `needle_lower` (уже в нижнем регистре) в `hay`.
+///
+/// Возвращает диапазон **в исходной строке**. Позицию из `to_lowercase()`
+/// брать нельзя: смена регистра меняет длину (`İ` → `i̇`, знак Кельвина `K` →
+/// `k`), и тогда сниппет съезжает (C2).
+fn find_ci(hay: &str, needle_lower: &str) -> Option<std::ops::Range<usize>> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let (lower, map) = lower_with_map(hay);
+    let pos = lower.find(needle_lower)?;
+    let start = map[pos];
+    let mut end = map[pos + needle_lower.len()];
+    if end <= start {
+        // Совпадение «внутри» одного исходного символа (например, `i` в `İ`).
+        end = start + hay[start..].chars().next().map(char::len_utf8).unwrap_or(0);
+    }
+    Some(start..end)
+}
+
+/// Нижний регистр строки и карта «смещение в нижнем регистре → смещение в
+/// исходной строке» (последний элемент карты — `len()` исходной строки).
+fn lower_with_map(s: &str) -> (String, Vec<usize>) {
+    let mut lower = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len() + 1);
+    for (index, ch) in s.char_indices() {
+        for lowered in ch.to_lowercase() {
+            lower.push(lowered);
+            for _ in 0..lowered.len_utf8() {
+                map.push(index);
+            }
+        }
+    }
+    map.push(s.len());
+    (lower, map)
 }
 
 /// Сниппет вокруг совпадения (с корректными границами UTF-8).
@@ -910,6 +953,69 @@ mod tests {
         println!(
             "2000 заметок × 10 ссылок: build {build:?}; backlinks() до {naive:?}, после {fast:?}"
         );
+    }
+
+    // ------------------------------- C2: поиск -------------------------------
+
+    #[test]
+    fn find_ci_returns_range_in_the_original_string() {
+        // Кириллица: нижний регистр не меняет длину.
+        assert_eq!(find_ci("Ёлка стоит", "ёлка"), Some(0..8));
+        // Знак Кельвина U+212A (не латинская K): 3 байта → «k» 1 байт,
+        // длина меняется, поэтому диапазон должен вернуться в исходной строке.
+        let kelvin = "\u{212A}ельвин";
+        assert_eq!(find_ci(kelvin, "kельвин"), Some(0..kelvin.len()));
+        // İ U+0130: 2 байта → «i» + комбинирующая точка, длина меняется.
+        // Позиция из to_lowercase() (4) разрезала бы «BC» пополам.
+        assert_eq!(find_ci("AİBC", "bc"), Some(3..5));
+        assert_eq!(find_ci("без совпадений", "zzz"), None);
+        assert_eq!(find_ci("что-то", ""), None);
+    }
+
+    /// Сниппет вокруг совпадения не съезжает, если текст содержит `İ`.
+    #[test]
+    fn snippet_is_correct_after_a_case_changing_character() {
+        let text = "AİBC искомое слово";
+        let range = find_ci(text, "искомое").expect("совпадение есть");
+        let s = snippet(text, range.start, range.len());
+        assert!(s.contains("искомое"), "{s}");
+    }
+
+    /// C2: совпадение в заголовке поднимается выше совпадения только в тексте.
+    #[test]
+    fn search_ranks_title_matches_first() {
+        let (vault, _dir) = test_vault();
+        vault
+            .write(
+                Path::new("z-body.md"),
+                "В теле упоминается пони, а заголовок другой",
+            )
+            .unwrap();
+        vault
+            .write(
+                Path::new("a-title.md"),
+                "---\ntitle: Пони\n---\nТекст без слова.\n",
+            )
+            .unwrap();
+
+        let index = Index::build(&vault).unwrap();
+        let hits = index.search("пони", 10);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(
+            hits[0].0,
+            PathBuf::from("a-title.md"),
+            "сначала заголовок: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_trims_query_and_ignores_empty() {
+        let (vault, _dir) = test_vault();
+        vault.write(Path::new("a.md"), "пони").unwrap();
+        let index = Index::build(&vault).unwrap();
+        assert_eq!(index.search("  пони  ", 10).len(), 1);
+        assert!(index.search("   ", 10).is_empty());
+        assert!(index.search("", 10).is_empty());
     }
 
     #[test]

@@ -86,6 +86,11 @@ fn editor_id() -> egui::Id {
     egui::Id::unique(EDITOR_ID_SRC)
 }
 
+/// Кеш результатов поиска: нормализованный запрос, поколение индекса, готовые
+/// результаты. Поколение меняется при каждом изменении индекса, поэтому кеш
+/// сам «протухает» после сохранения заметки или внешней правки.
+type SearchCache = Option<(String, u64, Vec<(PathBuf, String)>)>;
+
 /// Режим отображения: только редактор / сплит / только предпросмотр.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub(crate) enum ViewMode {
@@ -156,6 +161,9 @@ pub(crate) struct VaultState {
     pub(crate) tree_w: f32,
     pub(crate) show_graph: bool,
     pub(crate) search_query: String,
+    /// Кеш результатов поиска (C2): пересчёт только при смене запроса
+    /// или поколения индекса.
+    search_cache: SearchCache,
     pub(crate) quick_open: Option<QuickOpen>,
     pub(crate) graph: GraphView,
     pub(crate) notices: Notices,
@@ -187,6 +195,7 @@ impl VaultState {
             tree_w: 240.0,
             show_graph: false,
             search_query: String::new(),
+            search_cache: None,
             quick_open: None,
             graph: GraphView::default(),
             notices,
@@ -270,6 +279,25 @@ impl VaultState {
             self.graph.update(&self.index);
             self.graph_generation = generation;
         }
+    }
+
+    /// Результаты поиска по текущему запросу с кешем (C2): пересчёт только
+    /// когда изменился запрос или поколение индекса.
+    pub(crate) fn search_results(&mut self, limit: usize) -> Vec<(PathBuf, String)> {
+        let query = self.search_query.trim().to_lowercase();
+        let generation = self.index.generation();
+        if let Some((cached_query, cached_generation, results)) = &self.search_cache {
+            if *cached_query == query && *cached_generation == generation {
+                return results.clone();
+            }
+        }
+        let results = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.index.search(&query, limit)
+        };
+        self.search_cache = Some((query, generation, results.clone()));
+        results
     }
 
     /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
@@ -1117,6 +1145,41 @@ mod tests {
         assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
         // Только якорь — создавать нечего.
         assert_eq!(new_note_path(from, "#Только якорь"), None);
+    }
+
+    // --------- C2: кеш результатов поиска ---------
+
+    /// Кеш живёт до смены запроса или поколения индекса.
+    #[test]
+    fn search_results_are_cached_by_query_and_generation() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("b.md"), "пони в тексте").unwrap();
+        vs.rescan();
+        vs.search_query = "пони".to_string();
+
+        let first = vs.search_results(10);
+        assert!(
+            first.iter().any(|(p, _)| p == Path::new("b.md")),
+            "{first:?}"
+        );
+
+        // Файл появился, но индекс не пересобран: кеш отдаёт прежний результат.
+        std::fs::write(dir.join("c.md"), "тоже пони").unwrap();
+        let cached = vs.search_results(10);
+        assert_eq!(cached.len(), first.len(), "{cached:?}");
+        assert!(!cached.iter().any(|(p, _)| p == Path::new("c.md")));
+
+        // Пересканирование меняет поколение — кеш пересчитывается.
+        vs.rescan();
+        let refreshed = vs.search_results(10);
+        assert!(
+            refreshed.iter().any(|(p, _)| p == Path::new("c.md")),
+            "{refreshed:?}"
+        );
+
+        // Другой запрос — другой результат.
+        vs.search_query = "нет-такого".to_string();
+        assert!(vs.search_results(10).is_empty());
     }
 
     // --------- B11: Esc очищает поиск только из поля поиска ---------
