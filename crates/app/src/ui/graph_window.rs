@@ -15,8 +15,13 @@ pub(crate) fn show(ui: &mut egui::Ui, vs: &mut VaultState) -> Option<PathBuf> {
         .default_size([520.0, 420.0])
         .resizable(true)
         .show(ui.ctx(), |ui| {
-            for _ in 0..3 {
-                vs.graph.step();
+            // Граф пересобирается только когда окно действительно видно (C4):
+            // пересканирование vault лишь помечает его «грязным».
+            vs.sync_graph();
+            // Раскладываем, пока симуляция не успокоится; после этого кадры
+            // не нужны и процессор свободен.
+            if vs.graph.animate(3) {
+                ui.ctx().request_repaint();
             }
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::click());
@@ -67,7 +72,10 @@ pub(crate) fn show(ui: &mut egui::Ui, vs: &mut VaultState) -> Option<PathBuf> {
                 painter.line_segment([map(pa), map(pb)], stroke);
             }
 
-            // Узлы.
+            // Узлы. При большой сети подписи у всех узлов превращаются в кашу,
+            // поэтому их видно только у открытой заметки и у узла под курсором.
+            let many_nodes = n > 300;
+            let hover_pos = response.hover_pos();
             let click_pos = response
                 .clicked()
                 .then(|| response.interact_pointer_pos())
@@ -85,13 +93,16 @@ pub(crate) fn show(ui: &mut egui::Ui, vs: &mut VaultState) -> Option<PathBuf> {
                     ui.visuals().widgets.inactive.fg_stroke.color
                 };
                 painter.circle_filled(center, if is_open { 7.0 } else { 5.0 }, color);
-                painter.text(
-                    center + egui::vec2(0.0, 10.0),
-                    egui::Align2::CENTER_TOP,
-                    title,
-                    egui::FontId::proportional(11.0),
-                    ui.visuals().text_color(),
-                );
+                let near_cursor = hover_pos.is_some_and(|h| (h - center).length() < 14.0);
+                if !many_nodes || is_open || near_cursor {
+                    painter.text(
+                        center + egui::vec2(0.0, 10.0),
+                        egui::Align2::CENTER_TOP,
+                        title,
+                        egui::FontId::proportional(11.0),
+                        ui.visuals().text_color(),
+                    );
+                }
                 if response.clicked() && (click_pos - center).length() < 14.0 {
                     clicked = Some(path.to_path_buf());
                 }

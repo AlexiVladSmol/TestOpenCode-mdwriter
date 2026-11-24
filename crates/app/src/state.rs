@@ -113,6 +113,8 @@ pub(crate) struct VaultState {
     pub(crate) search_query: String,
     pub(crate) quick_open: Option<QuickOpen>,
     pub(crate) graph: GraphView,
+    /// Индекс изменился, а граф ещё не пересобран (собирается при показе окна).
+    pub(crate) graph_dirty: bool,
     pub(crate) notices: Notices,
 }
 
@@ -142,6 +144,7 @@ impl VaultState {
             search_query: String::new(),
             quick_open: None,
             graph: GraphView::default(),
+            graph_dirty: false,
             notices,
         };
         s.rescan();
@@ -168,8 +171,18 @@ impl VaultState {
             }
         };
         self.report_index_warnings();
-        self.graph.update(&self.index);
+        // Граф собирается лениво: пока окно графа закрыто, пересборка не нужна.
+        self.graph_dirty = true;
         self.check_open_on_disk();
+    }
+
+    /// Пересобирает граф связей, если индекс изменился. Вызывается при
+    /// показе окна графа: пока окно закрыто, пересборка не нужна (C4).
+    pub(crate) fn sync_graph(&mut self) {
+        if self.graph_dirty {
+            self.graph.update(&self.index);
+            self.graph_dirty = false;
+        }
     }
 
     /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
@@ -1308,6 +1321,23 @@ mod tests {
         let ok = preview::Action::OpenWiki("Новая заметка".to_string());
         assert_eq!(vs.open_wiki(&ok), Some(PathBuf::from("Новая заметка.md")));
         assert!(dir.join("Новая заметка.md").exists());
+    }
+
+    /// C4: граф собирается лениво — при пересканировании только помечается,
+    /// а собирается при первом показе окна.
+    #[test]
+    fn graph_is_built_lazily() {
+        let (mut vs, _dir) = open_a();
+        assert!(vs.graph_dirty, "после открытия vault граф ждёт сборки");
+        assert_eq!(vs.graph.node_count(), 0);
+
+        vs.sync_graph();
+        assert!(!vs.graph_dirty);
+        assert_eq!(vs.graph.node_count(), 1, "в vault одна заметка");
+
+        // Повторный пересбор не нужен.
+        vs.sync_graph();
+        assert!(!vs.graph_dirty);
     }
 
     /// Уведомления о пропущенных файлах индекса.

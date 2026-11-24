@@ -11,6 +11,10 @@ use petgraph::Undirected;
 /// Тип неориентированного графа заметок.
 type GraphTy = PGraph<String, (), Undirected>;
 
+/// Порог «граф успокоился»: суммарная кинетическая энергия, ниже которой
+/// дальнейшие шаги ничего не меняют на глаз.
+const SETTLE_ENERGY: f32 = 0.5;
+
 /// Граф заметок с позициями узлов для отрисовки.
 pub struct GraphView {
     graph: GraphTy,
@@ -19,6 +23,8 @@ pub struct GraphView {
     titles: Vec<String>,
     pos: Vec<Vec2>,
     vel: Vec<Vec2>,
+    /// Симуляция успокоилась: шаги прекращаются, пока граф не изменят.
+    settled: bool,
 }
 
 impl Default for GraphView {
@@ -29,6 +35,7 @@ impl Default for GraphView {
             titles: Vec::new(),
             pos: Vec::new(),
             vel: Vec::new(),
+            settled: false,
         }
     }
 }
@@ -44,6 +51,8 @@ impl GraphView {
             .collect();
 
         self.rebuild(index);
+        // Новый граф — снова есть что раскладывать.
+        self.settled = false;
 
         for (i, p) in self.paths.iter().enumerate() {
             if let Some(v) = old.get(p) {
@@ -94,10 +103,11 @@ impl GraphView {
     }
 
     /// Один шаг симуляции (отталкивание + пружины + гравитация к центру).
-    pub fn step(&mut self) {
+    /// Возвращает суммарную кинетическую энергию после шага.
+    pub fn step(&mut self) -> f32 {
         let n = self.pos.len();
         if n < 2 {
-            return;
+            return 0.0;
         }
         let k = 110.0; // «идеальная» длина ребра
 
@@ -144,6 +154,33 @@ impl GraphView {
             }
             *p += *v;
         }
+
+        self.vel.iter().map(|v| v.length_sq()).sum()
+    }
+
+    /// Делает до `steps` шагов, пока симуляция не успокоится.
+    /// Возвращает `true`, если граф ещё раскладывается и нужен новый кадр.
+    pub fn animate(&mut self, steps: usize) -> bool {
+        if self.settled {
+            return false;
+        }
+        for _ in 0..steps.max(1) {
+            if self.step() < SETTLE_ENERGY {
+                self.settled = true;
+                break;
+            }
+        }
+        !self.settled
+    }
+
+    /// Успокоилась ли симуляция (шаги не нужны, перерисовывать нечего).
+    pub fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Будит симуляцию: граф изменили или пользователь тронул узел.
+    pub fn wake(&mut self) {
+        self.settled = false;
     }
 
     pub fn node_count(&self) -> usize {
@@ -167,5 +204,88 @@ impl GraphView {
                     .map(|(a, b)| (a.index(), b.index()))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Пустой временный vault (удаляется вручную в конце теста).
+    fn temp_vault(tag: &str) -> (vault::Vault, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mdwriter-graph-{tag}-{unique}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (vault::Vault::open(dir.clone()), dir)
+    }
+
+    fn index_with_two_linked_notes(tag: &str) -> (Index, PathBuf) {
+        let (vault, dir) = temp_vault(tag);
+        vault.write(Path::new("a.md"), "Ссылка на [[b]]").unwrap();
+        vault.write(Path::new("b.md"), "Ссылка на [[a]]").unwrap();
+        (Index::build(&vault).unwrap(), dir)
+    }
+
+    /// C4: симуляция засыпает, когда узлы перестают двигаться, и снова
+    /// просыпается при изменении графа.
+    #[test]
+    fn simulation_settles_and_wakes_on_update() {
+        let (index, dir) = index_with_two_linked_notes("settle");
+        let mut graph = GraphView::default();
+        graph.update(&index);
+        assert!(!graph.settled(), "после сборки есть что раскладывать");
+
+        let mut frames = 0;
+        while graph.animate(3) {
+            frames += 1;
+            assert!(frames < 5000, "симуляция не успокоилась за {frames} кадров");
+        }
+        assert!(graph.settled());
+        // Успокоившийся граф кадров не требует.
+        assert!(!graph.animate(3));
+
+        // Изменение индекса будит симуляцию.
+        graph.update(&index);
+        assert!(!graph.settled());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// C4: пустой граф сразу считается успокоившимся.
+    #[test]
+    fn empty_graph_is_settled_immediately() {
+        let (vault, dir) = temp_vault("empty");
+        let index = Index::build(&vault).unwrap();
+        let mut graph = GraphView::default();
+        graph.update(&index);
+        assert_eq!(graph.node_count(), 0);
+        assert!(!graph.animate(3));
+        assert!(graph.settled());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wake_restarts_the_simulation() {
+        let (index, dir) = index_with_two_linked_notes("wake");
+        let mut graph = GraphView::default();
+        graph.update(&index);
+        while graph.animate(3) {}
+        assert!(graph.settled());
+
+        graph.wake();
+        assert!(!graph.settled(), "после wake шаги снова разрешены");
+        // Позиции не менялись, поэтому энергия нулевая и граф тут же засыпает —
+        // wake не «крутит» симуляцию сам по себе.
+        assert!(!graph.animate(3));
+        assert!(graph.settled());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

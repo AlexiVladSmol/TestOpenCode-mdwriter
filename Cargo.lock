@@ -1341,6 +1341,7 @@ version = "0.1.2"
 dependencies = [
  "egui",
  "mdwriter-index",
+ "mdwriter-vault",
  "petgraph",
 ]
 

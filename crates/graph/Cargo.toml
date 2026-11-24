@@ -11,3 +11,6 @@ publish = false
 egui.workspace = true
 index = { package = "mdwriter-index", path = "../index" }
 petgraph.workspace = true
+
+[dev-dependencies]
+vault = { package = "mdwriter-vault", path = "../vault" }
