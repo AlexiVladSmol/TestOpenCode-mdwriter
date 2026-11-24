@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod notice;
+mod sync;
 mod tree;
 
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use graph::GraphView;
 use index::Index;
 use notice::Notices;
-use vault::{Vault, VaultWatcher};
+use sync::Reconcile;
+use vault::{Vault, VaultError, VaultWatcher};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
 
@@ -291,6 +293,14 @@ struct VaultState {
     dirty: bool,
     /// Последняя попытка сохранения открытой заметки завершилась ошибкой.
     save_failed: bool,
+    /// Содержимое файла на момент последнего чтения или успешной записи:
+    /// по нему видно, что файл изменили извне.
+    disk_text: Option<String>,
+    /// Файл изменён извне, а в редакторе есть несохранённые правки.
+    /// Пока флаг стоит, автосохранение не пишет на диск.
+    conflict: bool,
+    /// Файл удалён/переименован извне, а в редакторе есть несохранённые правки.
+    orphaned: bool,
     last_edit: Option<f64>,
     new_note_name: String,
     view_mode: ViewMode,
@@ -317,6 +327,9 @@ impl VaultState {
             editor_text: String::new(),
             dirty: false,
             save_failed: false,
+            disk_text: None,
+            conflict: false,
+            orphaned: false,
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
@@ -352,32 +365,122 @@ impl VaultState {
             }
         };
         self.graph.update(&self.index);
-        // Если открытая заметка исчезла — закрываем её.
-        if let Some(rel) = &self.open {
-            if !self.notes.contains(rel) {
-                self.open = None;
-                self.editor_text.clear();
+        self.check_open_on_disk();
+    }
+
+    /// Читает файл заметки с диска. `Ok(None)` — файла нет.
+    fn read_disk(&self, rel: &Path) -> Result<Option<String>, String> {
+        match self.vault.read(rel) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) => match &e {
+                VaultError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                #[allow(unreachable_patterns)] // на случай новых вариантов VaultError
+                _ => Err(e.to_string()),
+            },
+        }
+    }
+
+    /// Сверяет открытую заметку с файлом на диске (после внешних изменений).
+    fn check_open_on_disk(&mut self) {
+        let Some(rel) = self.open.clone() else {
+            return;
+        };
+        let disk = match self.read_disk(&rel) {
+            Ok(disk) => disk,
+            Err(e) => {
+                self.notices.error_keyed(
+                    &format!("check:{}", rel.display()),
+                    format!("Не удалось перечитать {}: {e}", rel.display()),
+                );
+                return;
+            }
+        };
+        self.notices.clear_key(&format!("check:{}", rel.display()));
+        match sync::reconcile(
+            disk.as_deref(),
+            self.disk_text.as_deref(),
+            &self.editor_text,
+            self.dirty,
+        ) {
+            Reconcile::Unchanged => {
+                // Файл вернулся к известному состоянию — писать снова безопасно.
+                self.conflict = false;
+                self.orphaned = false;
+            }
+            Reconcile::Synced => {
+                self.clear_save_error();
+                self.disk_text = disk;
                 self.dirty = false;
-                self.last_edit = None;
+                self.conflict = false;
+                self.orphaned = false;
+            }
+            Reconcile::Reload => {
+                self.clear_save_error();
+                self.editor_text = disk.clone().unwrap_or_default();
+                self.disk_text = disk;
+                self.conflict = false;
+                self.orphaned = false;
+                self.notices
+                    .info(format!("Заметка обновлена с диска: {}", rel.display()));
+            }
+            Reconcile::Conflict => {
+                self.conflict = true;
+                self.orphaned = false;
+            }
+            Reconcile::Close => {
+                self.close_note();
+                self.notices
+                    .info(format!("Заметка удалена на диске: {}", rel.display()));
+            }
+            Reconcile::Orphaned => {
+                self.orphaned = true;
+                self.conflict = false;
             }
         }
     }
 
+    /// Снимает висящую ошибку сохранения: правки больше не нужно сохранять
+    /// (заметку перезагрузили с диска или закрыли).
+    fn clear_save_error(&mut self) {
+        if self.save_failed {
+            if let Some(rel) = &self.open {
+                self.notices.clear_key(&format!("save:{}", rel.display()));
+            }
+            self.save_failed = false;
+        }
+    }
+
+    /// Закрывает заметку без сохранения.
+    fn close_note(&mut self) {
+        self.clear_save_error();
+        self.open = None;
+        self.editor_text.clear();
+        self.disk_text = None;
+        self.dirty = false;
+        self.save_failed = false;
+        self.conflict = false;
+        self.orphaned = false;
+        self.last_edit = None;
+    }
+
     fn load(&mut self, rel: PathBuf) {
         // Не уходим с заметки, которую не удалось сохранить: иначе правки
-        // будут потеряны. Ошибка уже показана в `flush`.
+        // будут потеряны. Ошибка уже показана в `flush` или полосой конфликта.
         if self.flush().is_err() {
             self.notices.error(format!(
-                "Заметка {} не открыта: сначала нужно сохранить текущую",
+                "Заметка {} не открыта: сначала сохраните текущую или разрешите конфликт",
                 rel.display()
             ));
             return;
         }
         match self.vault.read(&rel) {
             Ok(text) => {
+                self.disk_text = Some(text.clone());
                 self.editor_text = text;
                 self.dirty = false;
                 self.save_failed = false;
+                self.conflict = false;
+                self.orphaned = false;
                 self.last_edit = None;
                 self.open = Some(rel);
             }
@@ -389,25 +492,68 @@ impl VaultState {
 
     /// Записывает открытую заметку, если есть несохранённые правки.
     /// При ошибке правки остаются несохранёнными (`dirty`), ошибка
-    /// показывается пользователю.
+    /// показывается пользователю. Если файл изменили или удалили извне,
+    /// ничего не пишет и ставит `conflict`/`orphaned` — решает пользователь.
     fn flush(&mut self) -> Result<(), String> {
         if !self.dirty {
             return Ok(());
         }
-        let Some(rel) = &self.open else {
+        let Some(rel) = self.open.clone() else {
             self.dirty = false;
             return Ok(());
         };
+        if self.conflict || self.orphaned {
+            return Err(format!("{}: ждёт решения конфликта", rel.display()));
+        }
+        // Защита от гонки: watcher мог ещё не сообщить о внешнем изменении.
+        if let Ok(disk) = self.read_disk(&rel) {
+            match sync::reconcile(
+                disk.as_deref(),
+                self.disk_text.as_deref(),
+                &self.editor_text,
+                true,
+            ) {
+                Reconcile::Synced => {
+                    self.clear_save_error();
+                    self.disk_text = disk;
+                    self.dirty = false;
+                    return Ok(());
+                }
+                Reconcile::Conflict => {
+                    self.conflict = true;
+                    return Err(format!("{} изменён на диске", rel.display()));
+                }
+                Reconcile::Orphaned => {
+                    self.orphaned = true;
+                    return Err(format!("{} удалён на диске", rel.display()));
+                }
+                // При dirty = true остальные варианты — «можно писать».
+                Reconcile::Unchanged | Reconcile::Reload | Reconcile::Close => {}
+            }
+        }
+        // Если файл прочитать не удалось, всё равно пробуем записать:
+        // ошибка записи будет показана ниже.
+        self.write_now()
+    }
+
+    /// Безусловно записывает буфер в файл открытой заметки.
+    fn write_now(&mut self) -> Result<(), String> {
+        let Some(rel) = self.open.clone() else {
+            return Ok(());
+        };
         let key = format!("save:{}", rel.display());
-        match self.vault.write(rel, &self.editor_text) {
+        match self.vault.write(&rel, &self.editor_text) {
             Ok(()) => {
                 if self.save_failed {
                     // Проблема разрешилась — убираем висящую ошибку.
                     self.notices.clear_key(&key);
                     self.notices.info(format!("Сохранено: {}", rel.display()));
                 }
+                self.disk_text = Some(self.editor_text.clone());
                 self.dirty = false;
                 self.save_failed = false;
+                self.conflict = false;
+                self.orphaned = false;
                 Ok(())
             }
             Err(e) => {
@@ -419,8 +565,77 @@ impl VaultState {
         }
     }
 
+    // ------------------- Разрешение конфликта (A3) -------------------
+
+    /// «Загрузить с диска»: мои правки отбрасываются.
+    fn resolve_take_disk(&mut self) {
+        let Some(rel) = self.open.clone() else {
+            return;
+        };
+        match self.read_disk(&rel) {
+            Ok(Some(text)) => {
+                self.clear_save_error();
+                self.disk_text = Some(text.clone());
+                self.editor_text = text;
+                self.dirty = false;
+                self.conflict = false;
+                self.orphaned = false;
+            }
+            Ok(None) => self.close_note(),
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось прочитать {}: {e}", rel.display())),
+        }
+    }
+
+    /// «Оставить мои» / «Сохранить снова»: перезаписать файл буфером.
+    fn resolve_keep_mine(&mut self) {
+        // Ошибка записи уже показана уведомлением.
+        let _ = self.write_now();
+    }
+
+    /// Сохраняет мою версию копией рядом с заметкой. Возвращает путь копии.
+    fn save_copy(&mut self) -> Result<PathBuf, String> {
+        let Some(rel) = self.open.clone() else {
+            return Err("нет открытой заметки".to_string());
+        };
+        let copy = sync::conflict_copy_path(&rel, |p| self.vault.abs_path(p).exists());
+        match self.vault.write(&copy, &self.editor_text) {
+            Ok(()) => {
+                self.notices
+                    .info(format!("Ваша версия сохранена как {}", copy.display()));
+                Ok(copy)
+            }
+            Err(e) => {
+                let msg = format!("Не удалось сохранить копию {}: {e}", copy.display());
+                self.notices.error(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// «Сохранить мои как копию»: копия рядом, в редакторе — версия с диска.
+    fn resolve_save_copy(&mut self) {
+        if self.save_copy().is_ok() {
+            self.resolve_take_disk();
+            self.rescan();
+        }
+    }
+
+    /// Для выхода из приложения и смены vault: сохраняет правки, а если
+    /// мешает конфликт или удалённый файл — пишет копию, чтобы ничего
+    /// не потерять.
+    #[allow(dead_code)] // вызывается из on_exit/open_vault после слияния A1
+    fn flush_or_copy(&mut self) -> Result<(), String> {
+        if self.dirty && (self.conflict || self.orphaned) {
+            return self.save_copy().map(|_| ());
+        }
+        self.flush()
+    }
+
     fn maybe_autosave(&mut self, now: f64, ctx: &egui::Context) {
-        if !self.dirty {
+        // При конфликте ждём решения пользователя (полоса над редактором).
+        if !self.dirty || self.conflict || self.orphaned {
             return;
         }
         let due = match self.last_edit {
@@ -623,6 +838,95 @@ impl VaultState {
 
     // ------------------------- Центральная область -------------------------
 
+    /// Полоса над редактором, если файл изменён или удалён извне,
+    /// а в редакторе есть несохранённые правки.
+    fn ui_conflict_bar(&mut self, ui: &mut egui::Ui) {
+        #[derive(Clone, Copy)]
+        enum Choice {
+            TakeDisk,
+            KeepMine,
+            SaveCopy,
+            Close,
+        }
+        if !(self.conflict || self.orphaned) {
+            return;
+        }
+        let mut choice = None;
+        let color = ui.visuals().warn_fg_color;
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.0, color))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if self.conflict {
+                    ui.label(
+                        egui::RichText::new(
+                            "Файл изменён на диске другой программой, а у вас есть \
+                             несохранённые правки. Автосохранение приостановлено.",
+                        )
+                        .color(color),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button("Загрузить с диска")
+                            .on_hover_text("Ваши несохранённые правки пропадут")
+                            .clicked()
+                        {
+                            choice = Some(Choice::TakeDisk);
+                        }
+                        if ui
+                            .button("Оставить мои")
+                            .on_hover_text("Перезаписать файл вашей версией")
+                            .clicked()
+                        {
+                            choice = Some(Choice::KeepMine);
+                        }
+                        if ui
+                            .button("Сохранить мои как копию")
+                            .on_hover_text(
+                                "Ваша версия — в «имя (конфликт).md», в редакторе — версия с диска",
+                            )
+                            .clicked()
+                        {
+                            choice = Some(Choice::SaveCopy);
+                        }
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Файл удалён или переименован на диске, а у вас есть \
+                             несохранённые правки.",
+                        )
+                        .color(color),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Сохранить снова").clicked() {
+                            choice = Some(Choice::KeepMine);
+                        }
+                        if ui
+                            .button("Закрыть без сохранения")
+                            .on_hover_text("Ваши несохранённые правки пропадут")
+                            .clicked()
+                        {
+                            choice = Some(Choice::Close);
+                        }
+                    });
+                }
+            });
+        match choice {
+            Some(Choice::TakeDisk) => self.resolve_take_disk(),
+            Some(Choice::KeepMine) => {
+                self.resolve_keep_mine();
+                // Заметка могла быть удалена — обновим дерево и индекс.
+                if self.orphaned || !self.notes.iter().any(|n| Some(n) == self.open.as_ref()) {
+                    self.rescan();
+                }
+            }
+            Some(Choice::SaveCopy) => self.resolve_save_copy(),
+            Some(Choice::Close) => self.close_note(),
+            None => {}
+        }
+    }
+
     /// Отрисовка редактора.
     fn ui_editor(&mut self, ui: &mut egui::Ui, now: f64) {
         if self.open.is_some() {
@@ -644,6 +948,7 @@ impl VaultState {
                 }
             });
             ui.separator();
+            self.ui_conflict_bar(ui);
 
             let theme =
                 egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
@@ -1634,5 +1939,168 @@ mod tests {
         let pos = text.find('b').unwrap();
         let r = lines_range(text, pos, pos);
         assert_eq!(&text[r], "b");
+    }
+
+    // --------- A3: внешние изменения открытой заметки (на реальных файлах) ---------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Vault во временной папке с заметкой `a.md` = "исходный", открытой в редакторе.
+    fn open_a() -> (VaultState, PathBuf) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mdwriter-a3-{unique}-{}",
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "исходный").unwrap();
+        let watcher = VaultWatcher::new(&dir).unwrap();
+        let mut vs = VaultState::open(Vault::open(dir.clone()), watcher, Notices::default());
+        vs.load(PathBuf::from("a.md"));
+        assert_eq!(vs.editor_text, "исходный");
+        (vs, dir)
+    }
+
+    fn edit(vs: &mut VaultState, text: &str) {
+        vs.editor_text = text.to_string();
+        vs.dirty = true;
+    }
+
+    fn disk(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("a.md")).unwrap()
+    }
+
+    #[test]
+    fn a3_reload_when_changed_externally_without_edits() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("a.md"), "извне").unwrap();
+        vs.rescan();
+        assert_eq!(vs.editor_text, "извне");
+        assert!(!vs.conflict && !vs.dirty);
+    }
+
+    #[test]
+    fn a3_own_save_is_not_a_conflict() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        vs.flush().unwrap();
+        vs.rescan(); // как после события watcher о нашей же записи
+        assert!(!vs.conflict && !vs.dirty);
+        assert_eq!(disk(&dir), "мои");
+    }
+
+    #[test]
+    fn a3_conflict_on_rescan_keeps_edits_and_file() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        assert!(vs.conflict);
+        assert_eq!(vs.editor_text, "мои");
+        assert!(vs.flush().is_err(), "при конфликте автосохранение не пишет");
+        assert_eq!(disk(&dir), "чужие");
+    }
+
+    #[test]
+    fn a3_flush_detects_race_before_watcher() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        // rescan ещё не было — flush сам замечает внешнее изменение.
+        assert!(vs.flush().is_err());
+        assert!(vs.conflict);
+        assert_eq!(disk(&dir), "чужие");
+    }
+
+    #[test]
+    fn a3_resolve_keep_mine_overwrites() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        vs.resolve_keep_mine();
+        assert_eq!(disk(&dir), "мои");
+        assert!(!vs.conflict && !vs.dirty);
+    }
+
+    #[test]
+    fn a3_resolve_take_disk_drops_edits() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        vs.resolve_take_disk();
+        assert_eq!(vs.editor_text, "чужие");
+        assert!(!vs.conflict && !vs.dirty);
+        assert_eq!(disk(&dir), "чужие");
+    }
+
+    #[test]
+    fn a3_resolve_save_copy_keeps_both_versions() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        vs.resolve_save_copy();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a (конфликт).md")).unwrap(),
+            "мои"
+        );
+        assert_eq!(vs.editor_text, "чужие");
+        assert_eq!(disk(&dir), "чужие");
+        assert!(!vs.conflict && !vs.dirty);
+    }
+
+    #[test]
+    fn a3_orphaned_keeps_buffer_and_can_save_again() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::remove_file(dir.join("a.md")).unwrap();
+        vs.rescan();
+        assert!(vs.orphaned);
+        assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
+        assert_eq!(vs.editor_text, "мои");
+        vs.resolve_keep_mine();
+        assert_eq!(disk(&dir), "мои");
+        assert!(!vs.orphaned && !vs.dirty);
+    }
+
+    #[test]
+    fn a3_close_when_deleted_without_edits() {
+        let (mut vs, dir) = open_a();
+        std::fs::remove_file(dir.join("a.md")).unwrap();
+        vs.rescan();
+        assert!(vs.open.is_none());
+        assert!(vs.editor_text.is_empty());
+    }
+
+    #[test]
+    fn a3_flush_or_copy_never_loses_edits() {
+        let (mut vs, dir) = open_a();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        vs.flush_or_copy().unwrap();
+        assert_eq!(disk(&dir), "чужие");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a (конфликт).md")).unwrap(),
+            "мои"
+        );
+    }
+
+    #[test]
+    fn a3_load_other_note_blocked_during_conflict() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("b.md"), "b").unwrap();
+        edit(&mut vs, "мои");
+        std::fs::write(dir.join("a.md"), "чужие").unwrap();
+        vs.rescan();
+        vs.load(PathBuf::from("b.md"));
+        assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
+        assert_eq!(vs.editor_text, "мои");
     }
 }
