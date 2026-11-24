@@ -627,8 +627,9 @@ impl eframe::App for App {
                     }
                 }
 
-                // Граф связей.
+                // Граф связей (перестраивается лениво — только пока окно открыто).
                 if vs.show_graph {
+                    vs.refresh_graph();
                     if let Some(rel) = ui::graph_window::show(ui, vs) {
                         vs.load(rel);
                     }
