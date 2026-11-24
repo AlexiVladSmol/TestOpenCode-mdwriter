@@ -511,6 +511,13 @@ mod tests {
         assert!(w.skipped().is_empty(), "{mode:?}: {:?}", w.skipped());
     }
 
+    /// Рекурсивный режим проверяем только там, где он включается
+    /// (`WatchMode::for_platform`). На Linux `notify` эмулирует его поверх
+    /// inotify и ставит слежение за новой папкой с запаздыванием: файл,
+    /// записанный сразу после `mkdir`, теряется (сценарий 2 падает в CI на
+    /// Ubuntu). Поэтому на Linux приложение использует режим по папкам — его
+    /// тест ниже идёт на всех ОС.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn g7a_new_folders_recursive_mode() {
         new_folders_are_watched(WatchMode::Recursive);
