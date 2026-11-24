@@ -68,16 +68,11 @@ impl GraphView {
             titles.push(title);
         }
 
+        // Связи уже разрешены индексом (без ссылок на себя и дублей).
         for (path, id) in node_ids.iter() {
-            if let Some(meta) = index.meta(path) {
-                for target in &meta.links_out {
-                    if let Some(to) = index.resolve_wikilink(path, target) {
-                        if let Some(to_id) = node_ids.get(&to) {
-                            if to_id != id {
-                                graph.update_edge(*id, *to_id, ());
-                            }
-                        }
-                    }
+            for to in index.links(path) {
+                if let Some(to_id) = node_ids.get(to) {
+                    graph.update_edge(*id, *to_id, ());
                 }
             }
         }
