@@ -389,11 +389,16 @@ mod tests {
 
     #[test]
     fn resolve_input_handles_absolute_relative_and_home() {
-        let base = PathBuf::from("/tmp/base");
+        let tmp = TempDir::new("resolve");
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Абсолютный путь (строится из реальной временной папки, чтобы тест
+        // работал и на Windows) не должен склеиваться с базой.
+        let absolute = tmp.path().to_path_buf();
         assert_eq!(
-            resolve_input("/etc", &base),
-            PathBuf::from("/etc"),
-            "абсолютный путь не должен склеиваться с базой"
+            resolve_input(&absolute.display().to_string(), &base),
+            absolute
         );
         assert_eq!(resolve_input("notes", &base), base.join("notes"));
         assert_eq!(resolve_input("  notes  ", &base), base.join("notes"));
@@ -414,8 +419,9 @@ mod tests {
 
     #[test]
     fn save_path_rejects_slashes_and_empty_names() {
-        let mut picker = Picker::export_html(PathBuf::from("/tmp"), "note.html".to_string());
-        assert_eq!(picker.save_path().unwrap(), PathBuf::from("/tmp/note.html"));
+        let tmp = TempDir::new("save");
+        let mut picker = Picker::export_html(tmp.path().to_path_buf(), "note.html".to_string());
+        assert_eq!(picker.save_path().unwrap(), tmp.path().join("note.html"));
 
         picker.name_input = "   ".to_string();
         assert!(picker.save_path().is_err());
@@ -424,7 +430,7 @@ mod tests {
         assert!(picker.save_path().is_err());
 
         picker.name_input = "note".to_string();
-        assert_eq!(picker.save_path().unwrap(), PathBuf::from("/tmp/note.html"));
+        assert_eq!(picker.save_path().unwrap(), tmp.path().join("note.html"));
     }
 
     #[test]
