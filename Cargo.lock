@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "graph"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "egui",
  "index",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "markdown",
  "vault",
@@ -1336,14 +1336,14 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "markdown"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "mdwriter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "eframe",
@@ -2111,7 +2111,7 @@ checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
 name = "preview"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2781,7 +2781,7 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 
 [[package]]
 name = "vault"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "notify",
  "thiserror 2.0.21",
