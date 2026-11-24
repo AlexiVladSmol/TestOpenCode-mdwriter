@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod notice;
 mod tree;
 
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use graph::GraphView;
 use index::Index;
+use notice::Notices;
 use vault::{Vault, VaultWatcher};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
@@ -268,6 +270,8 @@ struct App {
     vault: Option<VaultState>,
     settings: Settings,
     settings_dirty: bool,
+    /// Уведомления пользователю (общая очередь, клон есть у `VaultState`).
+    notices: Notices,
 }
 
 /// Состояние быстрого переключателя (Ctrl+O).
@@ -285,6 +289,8 @@ struct VaultState {
     open: Option<PathBuf>,
     editor_text: String,
     dirty: bool,
+    /// Последняя попытка сохранения открытой заметки завершилась ошибкой.
+    save_failed: bool,
     last_edit: Option<f64>,
     new_note_name: String,
     view_mode: ViewMode,
@@ -296,10 +302,11 @@ struct VaultState {
     search_query: String,
     quick_open: Option<QuickOpen>,
     graph: GraphView,
+    notices: Notices,
 }
 
 impl VaultState {
-    fn open(vault: Vault, watcher: VaultWatcher) -> Self {
+    fn open(vault: Vault, watcher: VaultWatcher, notices: Notices) -> Self {
         let mut s = Self {
             vault,
             watcher,
@@ -309,6 +316,7 @@ impl VaultState {
             open: None,
             editor_text: String::new(),
             dirty: false,
+            save_failed: false,
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
@@ -318,17 +326,31 @@ impl VaultState {
             search_query: String::new(),
             quick_open: None,
             graph: GraphView::default(),
+            notices,
         };
         s.rescan();
         s
     }
 
     fn rescan(&mut self) {
-        if let Ok(notes) = self.vault.list_notes() {
-            self.notes = notes;
-            self.tree = tree::build_tree(&self.notes);
+        match self.vault.list_notes() {
+            Ok(notes) => {
+                self.notes = notes;
+                self.tree = tree::build_tree(&self.notes);
+            }
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось прочитать список заметок: {e}")),
         }
-        self.index = Index::build(&self.vault).unwrap_or_default();
+        self.index = match Index::build(&self.vault) {
+            Ok(index) => index,
+            Err(e) => {
+                self.notices.error(format!(
+                    "Индекс не построен (поиск, backlinks и граф недоступны): {e}"
+                ));
+                Index::default()
+            }
+        };
         self.graph.update(&self.index);
         // Если открытая заметка исчезла — закрываем её.
         if let Some(rel) = &self.open {
@@ -342,26 +364,58 @@ impl VaultState {
     }
 
     fn load(&mut self, rel: PathBuf) {
-        self.flush();
+        // Не уходим с заметки, которую не удалось сохранить: иначе правки
+        // будут потеряны. Ошибка уже показана в `flush`.
+        if self.flush().is_err() {
+            self.notices.error(format!(
+                "Заметка {} не открыта: сначала нужно сохранить текущую",
+                rel.display()
+            ));
+            return;
+        }
         match self.vault.read(&rel) {
             Ok(text) => {
                 self.editor_text = text;
                 self.dirty = false;
+                self.save_failed = false;
                 self.last_edit = None;
                 self.open = Some(rel);
             }
-            Err(e) => eprintln!("failed to read {}: {e}", rel.display()),
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось открыть {}: {e}", rel.display())),
         }
     }
 
-    fn flush(&mut self) {
-        if self.dirty {
-            if let Some(rel) = &self.open {
-                if let Err(e) = self.vault.write(rel, &self.editor_text) {
-                    eprintln!("failed to save {}: {e}", rel.display());
-                }
-            }
+    /// Записывает открытую заметку, если есть несохранённые правки.
+    /// При ошибке правки остаются несохранёнными (`dirty`), ошибка
+    /// показывается пользователю.
+    fn flush(&mut self) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(rel) = &self.open else {
             self.dirty = false;
+            return Ok(());
+        };
+        let key = format!("save:{}", rel.display());
+        match self.vault.write(rel, &self.editor_text) {
+            Ok(()) => {
+                if self.save_failed {
+                    // Проблема разрешилась — убираем висящую ошибку.
+                    self.notices.clear_key(&key);
+                    self.notices.info(format!("Сохранено: {}", rel.display()));
+                }
+                self.dirty = false;
+                self.save_failed = false;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Не удалось сохранить {}: {e}", rel.display());
+                self.save_failed = true;
+                self.notices.error_keyed(&key, msg.clone());
+                Err(msg)
+            }
         }
     }
 
@@ -369,16 +423,20 @@ impl VaultState {
         if !self.dirty {
             return;
         }
-        match self.last_edit {
-            None => self.flush(),
+        let due = match self.last_edit {
+            None => true,
             Some(t) => {
                 let elapsed = now - t;
-                if elapsed >= AUTOSAVE_DELAY {
-                    self.flush();
-                } else {
+                if elapsed < AUTOSAVE_DELAY {
                     ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_DELAY - elapsed));
                 }
+                elapsed >= AUTOSAVE_DELAY
             }
+        };
+        if due && self.flush().is_err() {
+            // Повторим через AUTOSAVE_DELAY, а не в каждом кадре.
+            self.last_edit = Some(now);
+            ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_DELAY));
         }
     }
 
@@ -394,7 +452,8 @@ impl VaultState {
         };
         let rel = PathBuf::from(name);
         if let Err(e) = self.vault.create(&rel) {
-            eprintln!("failed to create {rel:?}: {e}");
+            self.notices
+                .error(format!("Не удалось создать {}: {e}", rel.display()));
             return;
         }
         self.new_note_name.clear();
@@ -424,7 +483,8 @@ impl VaultState {
                         Some(rel)
                     }
                     Err(e) => {
-                        eprintln!("failed to create {rel:?}: {e}");
+                        self.notices
+                            .error(format!("Не удалось создать {}: {e}", rel.display()));
                         None
                     }
                 }
@@ -573,8 +633,14 @@ impl VaultState {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                 );
+                // «•» вместо «●»: второго символа нет во встроенных шрифтах egui.
                 if self.dirty {
-                    ui.label("●");
+                    if self.save_failed {
+                        ui.label(egui::RichText::new("•").color(ui.visuals().error_fg_color))
+                            .on_hover_text("Не сохранено: ошибка записи, повтор автоматически");
+                    } else {
+                        ui.label("•").on_hover_text("Есть несохранённые правки");
+                    }
                 }
             });
             ui.separator();
@@ -686,18 +752,29 @@ impl App {
             vault: None,
             settings,
             settings_dirty: false,
+            notices: Notices::default(),
         };
 
         // Восстанавливаем последний vault.
         if let Some(path) = app.settings.last_vault.clone() {
             if path.is_dir() {
-                if let Ok(watcher) = VaultWatcher::new(&path) {
-                    let mut vs = VaultState::open(Vault::open(path), watcher);
-                    vs.view_mode = app.settings.view_mode;
-                    vs.show_graph = app.settings.show_graph;
-                    vs.tree_w = app.settings.tree_w;
-                    app.vault = Some(vs);
+                match VaultWatcher::new(&path) {
+                    Ok(watcher) => {
+                        let mut vs =
+                            VaultState::open(Vault::open(path), watcher, app.notices.clone());
+                        vs.view_mode = app.settings.view_mode;
+                        vs.show_graph = app.settings.show_graph;
+                        vs.tree_w = app.settings.tree_w;
+                        app.vault = Some(vs);
+                    }
+                    Err(e) => app.notices.error(format!(
+                        "Не удалось открыть последний vault {}: {e}",
+                        path.display()
+                    )),
                 }
+            } else {
+                app.notices
+                    .info(format!("Последний vault не найден: {}", path.display()));
             }
         }
 
@@ -708,7 +785,8 @@ impl App {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             match VaultWatcher::new(&path) {
                 Ok(watcher) => {
-                    let mut vs = VaultState::open(Vault::open(path.clone()), watcher);
+                    let mut vs =
+                        VaultState::open(Vault::open(path.clone()), watcher, self.notices.clone());
                     vs.view_mode = self.settings.view_mode;
                     vs.show_graph = self.settings.show_graph;
                     vs.tree_w = self.settings.tree_w;
@@ -716,7 +794,9 @@ impl App {
                     self.settings.last_vault = Some(path);
                     self.settings_dirty = true;
                 }
-                Err(e) => eprintln!("watch error: {e}"),
+                Err(e) => self
+                    .notices
+                    .error(format!("Не удалось открыть vault {}: {e}", path.display())),
             }
         }
     }
@@ -757,10 +837,13 @@ impl App {
         match serde_json::to_string_pretty(&self.settings) {
             Ok(s) => {
                 if let Err(e) = std::fs::write(&path, s) {
-                    eprintln!("settings save failed: {e}");
+                    self.notices
+                        .error(format!("Не удалось сохранить настройки: {e}"));
                 }
             }
-            Err(e) => eprintln!("settings serialize failed: {e}"),
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось сериализовать настройки: {e}")),
         }
         self.settings_dirty = false;
     }
@@ -774,7 +857,10 @@ impl App {
         };
         let rel = PathBuf::from(format!("{}.md", today_str()));
         if let Err(e) = vs.vault.create(&rel) {
-            eprintln!("failed to create daily note: {e}");
+            self.notices.error(format!(
+                "Не удалось создать ежедневную заметку {}: {e}",
+                rel.display()
+            ));
             return;
         }
         vs.rescan();
@@ -785,8 +871,15 @@ impl App {
     fn export_html(&mut self) {
         let Some(vs) = &self.vault else { return };
         let Some(rel) = &vs.open else { return };
-        let Ok(text) = vs.vault.read(rel) else {
-            return;
+        let text = match vs.vault.read(rel) {
+            Ok(text) => text,
+            Err(e) => {
+                self.notices.error(format!(
+                    "Экспорт невозможен: не удалось прочитать {}: {e}",
+                    rel.display()
+                ));
+                return;
+            }
         };
         let default_name = format!(
             "{}.html",
@@ -825,8 +918,13 @@ impl App {
         );
         html.push_str("\n</body>\n</html>\n");
 
-        if let Err(e) = std::fs::write(&path, html) {
-            eprintln!("export failed: {e}");
+        match std::fs::write(&path, html) {
+            Ok(()) => self
+                .notices
+                .info(format!("Экспортировано: {}", path.display())),
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось записать {}: {e}", path.display())),
         }
     }
 }
@@ -944,7 +1042,8 @@ impl eframe::App for App {
             }
             vs.maybe_autosave(now, ui.ctx());
             if ctrl_s {
-                vs.flush();
+                // Ошибка уже показана уведомлением; правки остаются несохранёнными.
+                let _ = vs.flush();
             }
             if ctrl_o {
                 vs.quick_open = Some(QuickOpen {
@@ -1496,6 +1595,7 @@ impl eframe::App for App {
         }
 
         self.sync_settings(ui.ctx());
+        self.notices.show(ui.ctx(), now);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
