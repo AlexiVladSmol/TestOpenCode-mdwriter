@@ -736,6 +736,13 @@ fn render_inline_with(
     }
 }
 
+/// Wikilink, в диапазон которого попадает индекс символа.
+/// Диапазон полуинтервальный: `[start, end)` — символ сразу после ссылки
+/// кликабельным не считается.
+fn link_at(links: &[LinkRange], idx: usize) -> Option<&LinkRange> {
+    links.iter().find(|lr| lr.start <= idx && idx < lr.end)
+}
+
 /// Рисует LayoutJob и обрабатывает клики по wikilinks внутри него.
 fn render_job(ui: &mut Ui, job: LayoutJob, links: &[LinkRange], actions: &mut Vec<Action>) {
     let response = ui.label(job.clone());
@@ -745,7 +752,7 @@ fn render_job(ui: &mut Ui, job: LayoutJob, links: &[LinkRange], actions: &mut Ve
             let local = pos - response.rect.min;
             let cursor = galley.cursor_from_pos(local);
             let idx = cursor.index.0;
-            if let Some(lr) = links.iter().find(|lr| lr.start <= idx && idx <= lr.end) {
+            if let Some(lr) = link_at(links, idx) {
                 actions.push(Action::OpenWiki(lr.target.clone()));
             }
         }
@@ -1076,6 +1083,20 @@ mod tests {
         let transformed = task_marker_offsets(&wiki_to_md(body)).len();
         assert_eq!(original, 3);
         assert_eq!(transformed, original);
+    }
+
+    #[test]
+    fn link_hit_test_is_half_open() {
+        let links = vec![LinkRange {
+            start: 3,
+            end: 7,
+            target: "A".to_string(),
+        }];
+        assert!(link_at(&links, 2).is_none());
+        assert!(link_at(&links, 3).is_some());
+        assert!(link_at(&links, 6).is_some());
+        // Символ сразу после ссылки уже не кликабелен.
+        assert!(link_at(&links, 7).is_none());
     }
 
     #[test]

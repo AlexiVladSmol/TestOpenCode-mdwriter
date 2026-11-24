@@ -213,6 +213,8 @@ impl eframe::App for App {
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
         let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        // Фокус нужен до отрисовки виджетов: состояние — с прошлого кадра.
+        let search_focused = ui.memory(|m| m.has_focus(state::search_id()));
 
         if let Some(vs) = self.vault.as_mut() {
             vs.poll_watcher(now, ui.ctx());
@@ -227,7 +229,9 @@ impl eframe::App for App {
                     selected: 0,
                 });
             }
-            if vs.quick_open.is_none() && esc && !vs.search_query.is_empty() {
+            if vs.quick_open.is_none()
+                && state::should_clear_search(esc, search_focused, vs.search_query.is_empty())
+            {
                 vs.search_query.clear();
             }
         }
@@ -345,7 +349,7 @@ impl eframe::App for App {
                             .on_hover_text("Горизонтальная линия")
                             .clicked()
                         {
-                            vs.wrap_selection(ui.ctx(), "\n---\n", "");
+                            vs.insert_horizontal_rule(ui.ctx());
                         }
                     });
                 });
@@ -404,6 +408,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut vs.search_query)
+                                .id(state::search_id())
                                 .hint_text("Поиск…")
                                 .desired_width(f32::INFINITY),
                         );

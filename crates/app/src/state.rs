@@ -10,7 +10,7 @@ use graph::GraphView;
 use index::Index;
 use vault::{Vault, VaultError, VaultWatcher};
 
-use crate::format::{lines_range, toggle_task_at};
+use crate::format::{self, lines_range, toggle_task_at};
 use crate::notice::Notices;
 use crate::sync::{self, Reconcile};
 use crate::tree;
@@ -147,7 +147,7 @@ impl VaultState {
 
     pub(crate) fn rescan(&mut self) {
         match self.vault.list_notes() {
-            Ok(notes) => {
+            Ok((notes, _warnings)) => {
                 self.notes = notes;
                 self.tree = tree::build_tree(&self.notes);
             }
@@ -164,8 +164,26 @@ impl VaultState {
                 Index::default()
             }
         };
+        self.report_index_warnings();
         self.graph.update(&self.index);
         self.check_open_on_disk();
+    }
+
+    /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
+    /// У `Notice` нет отдельного поля под подробности, поэтому первые
+    /// несколько путей попадают в текст сообщения.
+    fn report_index_warnings(&mut self) {
+        let warnings = self.index.warnings();
+        if warnings.is_empty() {
+            return;
+        }
+        let details: Vec<&str> = warnings.iter().take(3).map(String::as_str).collect();
+        let mut text = format!("Пропущено файлов: {}", warnings.len());
+        text.push_str(&format!(": {}", details.join("; ")));
+        if warnings.len() > details.len() {
+            text.push_str(" …");
+        }
+        self.notices.info(text);
     }
 
     /// Читает файл заметки с диска. `Ok(None)` — файла нет.
@@ -284,9 +302,14 @@ impl VaultState {
                 self.last_edit = None;
                 self.open = Some(rel);
             }
-            Err(e) => self
-                .notices
-                .error(format!("Не удалось открыть {}: {e}", rel.display())),
+            Err(e) => {
+                let msg = if is_utf8_error(&e) {
+                    format!("Файл {} не в UTF-8, открытие отменено", rel.display())
+                } else {
+                    format!("Не удалось открыть {}: {e}", rel.display())
+                };
+                self.notices.error(msg);
+            }
         }
     }
 
@@ -474,16 +497,13 @@ impl VaultState {
     }
 
     pub(crate) fn create_note(&mut self) {
-        let name = self.new_note_name.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let name = if name.ends_with(".md") {
-            name
-        } else {
-            format!("{name}.md")
+        let rel = match validate_note_name(&self.new_note_name) {
+            Ok(rel) => rel,
+            Err(msg) => {
+                self.notices.error(msg);
+                return;
+            }
         };
-        let rel = PathBuf::from(name);
         if let Err(e) = self.vault.create(&rel) {
             self.notices
                 .error(format!("Не удалось создать {}: {e}", rel.display()));
@@ -569,19 +589,25 @@ impl VaultState {
         let start = self.char_to_byte(range.start);
         let end = self.char_to_byte(range.end);
         let sel = self.editor_text[start..end].to_string();
+        let (new, cursor_in_new) = format::wrap_selection_text(&sel, before, after);
+        self.editor_text.replace_range(start..end, &new);
+        let cursor = self.editor_text[..start].chars().count() + cursor_in_new;
+        self.set_cursor(ctx, cursor);
+        self.dirty = true;
+        self.last_edit = None;
+    }
 
-        if !sel.is_empty() && sel.starts_with(before) && sel.ends_with(after) {
-            // Снять форматирование.
-            let inner = &sel[before.len()..sel.len() - after.len()];
-            self.editor_text.replace_range(start..end, inner);
-            let cursor = self.editor_text[..start].chars().count() + inner.chars().count();
-            self.set_cursor(ctx, cursor);
-        } else {
-            let new = format!("{before}{sel}{after}");
-            self.editor_text.replace_range(start..end, &new);
-            let cursor = self.editor_text[..start].chars().count() + new.chars().count();
-            self.set_cursor(ctx, cursor);
-        }
+    /// Кнопка «—»: вставляет `---` отдельной строкой после строки с концом
+    /// выделения. Выделенный текст не меняется.
+    pub(crate) fn insert_horizontal_rule(&mut self, ctx: &egui::Context) {
+        let Some(range) = self.selected_char_range(ctx) else {
+            return;
+        };
+        let end = self.char_to_byte(range.end);
+        let (new, cursor_byte) = format::insert_horizontal_rule(&self.editor_text, end);
+        let cursor = new[..cursor_byte].chars().count();
+        self.editor_text = new;
+        self.set_cursor(ctx, cursor);
         self.dirty = true;
         self.last_edit = None;
     }
@@ -741,7 +767,7 @@ impl VaultState {
 
             let theme =
                 egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
                 let mut job = egui_extras::syntax_highlighting::highlight(
                     ui.ctx(),
                     ui.style(),
@@ -749,11 +775,14 @@ impl VaultState {
                     buf.as_str(),
                     "md",
                 );
-                job.wrap.max_width = wrap_width;
+                // Перенос отключён: иначе длинные строки занимают несколько
+                // экранных строк, а номера в gutter не переносятся и «съезжают».
+                // Горизонтальная прокрутка — у ScrollArea::both.
+                job.wrap.max_width = f32::INFINITY;
                 ui.fonts_mut(|f| f.layout_job(job))
             };
 
-            let n_lines = self.editor_text.lines().count();
+            let n_lines = line_count(&self.editor_text);
             let digits = n_lines.to_string().len().max(2);
             let mut edit = egui::TextEdit::multiline(&mut self.editor_text)
                 .code_editor()
@@ -823,6 +852,30 @@ impl VaultState {
     }
 }
 
+/// Файл не удалось прочитать как UTF-8 (например, он в CP1251).
+fn is_utf8_error(e: &VaultError) -> bool {
+    matches!(e, VaultError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData)
+}
+
+/// Количество строк для нумерации в редакторе: пустой документ — одна строка,
+/// последняя пустая строка после `\n` тоже считается.
+pub(crate) fn line_count(text: &str) -> usize {
+    text.split('\n').count()
+}
+
+const SEARCH_ID_SRC: &str = "mdwriter_search";
+
+/// Id поля поиска: по нему проверяется фокус и адресуется TextEdit.
+pub(crate) fn search_id() -> egui::Id {
+    egui::Id::unique(SEARCH_ID_SRC)
+}
+
+/// Esc очищает поиск только когда фокус в самом поле поиска (не в редакторе
+/// и не при открытом Quick Open) и запрос не пуст.
+pub(crate) fn should_clear_search(esc: bool, search_focused: bool, query_empty: bool) -> bool {
+    esc && search_focused && !query_empty
+}
+
 /// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),
 /// `None` — если путь пустой (`[[#Заголовок]]`), создавать нечего.
 pub(crate) fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
@@ -837,6 +890,67 @@ pub(crate) fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
     };
     let dir = from.parent().unwrap_or(Path::new(""));
     Some(dir.join(name))
+}
+
+/// Проверяет имя новой заметки, введённое пользователем, и возвращает
+/// относительный путь внутри vault (с расширением `.md`, если его нет).
+///
+/// Запрещены: пустое имя, символы `<>:"|?*` и управляющие, пути вне vault,
+/// компоненты, заканчивающиеся точкой или пробелом, и зарезервированные
+/// имена Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
+pub(crate) fn validate_note_name(name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Имя заметки пустое".to_string());
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err("Имя содержит недопустимые символы: < > : \" | ? *".to_string());
+    }
+
+    let rel = Path::new(name);
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if part.ends_with('.') || part.ends_with(' ') {
+                    return Err(
+                        "Папка или файл не могут заканчиваться точкой или пробелом".to_string()
+                    );
+                }
+                let stem = Path::new(part.as_ref())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if is_reserved_windows_name(&stem) {
+                    return Err(format!("Имя «{stem}» зарезервировано в Windows"));
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err("Путь не должен выходить за пределы vault".to_string()),
+        }
+    }
+
+    let name = if name.to_lowercase().ends_with(".md") {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    };
+    Ok(PathBuf::from(name))
+}
+
+/// Зарезервированные имена устройств Windows (без учёта регистра и расширения).
+fn is_reserved_windows_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let bytes = upper.as_bytes();
+    bytes.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
 }
 
 #[cfg(test)]
@@ -860,6 +974,81 @@ mod tests {
         assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
         // Только якорь — создавать нечего.
         assert_eq!(new_note_path(from, "#Только якорь"), None);
+    }
+
+    // --------- B11: Esc очищает поиск только из поля поиска ---------
+
+    #[test]
+    fn esc_clears_search_only_when_the_field_has_focus() {
+        assert!(should_clear_search(true, true, false));
+        // Фокус в редакторе — Esc не трогает поиск.
+        assert!(!should_clear_search(true, false, false));
+        assert!(!should_clear_search(false, true, false));
+        // Пустой запрос очищать нечего.
+        assert!(!should_clear_search(true, true, true));
+    }
+
+    // --------- B10: количество строк для gutter ---------
+
+    #[test]
+    fn line_count_matches_editor_lines() {
+        // Пустой документ — одна строка.
+        assert_eq!(line_count(""), 1);
+        assert_eq!(line_count("одна"), 1);
+        // Последняя пустая строка после \n тоже считается.
+        assert_eq!(line_count("a\n"), 2);
+        assert_eq!(line_count("a\nb\nc\n"), 4);
+        assert_eq!(line_count("a\n\nb"), 3);
+    }
+
+    // --------- B4: проверка имён новых заметок ---------
+    #[test]
+    fn validate_note_name_adds_extension() {
+        assert_eq!(
+            validate_note_name("  Заметка  "),
+            Ok(PathBuf::from("Заметка.md"))
+        );
+        assert_eq!(
+            validate_note_name("папка/заметка.md"),
+            Ok(PathBuf::from("папка/заметка.md"))
+        );
+        assert_eq!(validate_note_name("A.MD"), Ok(PathBuf::from("A.MD")));
+    }
+
+    #[test]
+    fn validate_note_name_rejects_bad_names() {
+        for bad in [
+            "",
+            "   ",
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "конец.",
+            "a /b",
+            "a./b",
+            "CON",
+            "nul.md",
+            "Com1",
+            "lpt9.markdown",
+            "..",
+            "../секрет",
+            "a/../b",
+            "/etc/passwd",
+            "C:\\Windows\\x",
+        ] {
+            assert!(
+                validate_note_name(bad).is_err(),
+                "имя {bad:?} должно быть отклонено"
+            );
+        }
+        // Символы внутри имени и «COM10» — допустимы.
+        assert!(validate_note_name("COM10").is_ok());
+        assert!(validate_note_name("conspect").is_ok());
+        assert!(validate_note_name("draft~1").is_ok());
     }
 
     // --------- A3: внешние изменения открытой заметки (на реальных файлах) ---------

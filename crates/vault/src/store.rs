@@ -67,6 +67,9 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 pub enum VaultError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Путь выходит за пределы vault или не является корректным относительным.
+    #[error("недопустимый путь внутри vault: {0}")]
+    InvalidPath(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -93,23 +96,58 @@ impl Vault {
             .unwrap_or_else(|_| abs.to_path_buf())
     }
 
+    /// Абсолютный путь для отображения/проверок. Для файловых операций
+    /// используйте [`Vault::checked_path`]: здесь нет защиты от `..`.
     pub fn abs_path(&self, rel: &Path) -> PathBuf {
         self.root.join(rel)
+    }
+
+    /// Проверяет, что `rel` — корректный относительный путь внутри vault,
+    /// и возвращает абсолютный путь. `..`, абсолютные пути и префиксы диска
+    /// отклоняются (`VaultError::InvalidPath`).
+    fn checked_path(&self, rel: &Path) -> Result<PathBuf> {
+        let mut has_normal = false;
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(_) => has_normal = true,
+                std::path::Component::CurDir => {}
+                _ => return Err(VaultError::InvalidPath(rel.to_path_buf())),
+            }
+        }
+        if !has_normal {
+            return Err(VaultError::InvalidPath(rel.to_path_buf()));
+        }
+        Ok(self.root.join(rel))
     }
 
     /// Рекурсивный список всех `.md` файлов (относительные пути, отсортированы).
     /// Скрытые файлы и папки (начинающиеся с `.`) пропускаются, кроме самого корня:
     /// vault может лежать в скрытой папке (`~/.notes`). Расширение сравнивается
     /// без учёта регистра (`.md`, `.MD`).
-    pub fn list_notes(&self) -> Result<Vec<PathBuf>> {
+    ///
+    /// Ошибкой считается только недоступность корня. Проблемы с отдельными
+    /// записями (нет прав, битая ссылка) пропускаются и возвращаются вторым
+    /// элементом как предупреждения.
+    pub fn list_notes(&self) -> Result<(Vec<PathBuf>, Vec<String>)> {
         let mut notes = Vec::new();
+        let mut warnings = Vec::new();
         let walker = walkdir::WalkDir::new(&self.root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !is_hidden(e));
 
         for entry in walker {
-            let entry = entry.map_err(std::io::Error::other)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    // Корень недоступен — работать не с чем.
+                    if e.depth() == 0 {
+                        return Err(std::io::Error::other(e).into());
+                    }
+                    warnings.push(format!("пропущено при обходе: {e}"));
+                    continue;
+                }
+            };
             if entry.file_type().is_file() {
                 let path = entry.path();
                 let is_md = path
@@ -122,16 +160,27 @@ impl Vault {
             }
         }
         notes.sort();
-        Ok(notes)
+        warnings.sort();
+        Ok((notes, warnings))
     }
 
     pub fn read(&self, rel: &Path) -> Result<String> {
-        Ok(fs::read_to_string(self.abs_path(rel))?)
+        Ok(fs::read_to_string(self.checked_path(rel)?)?)
+    }
+
+    /// Читает файл, заменяя невалидные байты UTF-8 символом `�`.
+    /// Второй элемент — были ли такие байты (для предупреждений индекса).
+    pub fn read_lossy(&self, rel: &Path) -> Result<(String, bool)> {
+        let bytes = fs::read(self.checked_path(rel)?)?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok((text, false)),
+            Err(e) => Ok((String::from_utf8_lossy(e.as_bytes()).into_owned(), true)),
+        }
     }
 
     /// Атомарная запись: пишем во временный файл в той же папке, затем rename.
     pub fn write(&self, rel: &Path, content: &str) -> Result<()> {
-        let abs = self.abs_path(rel);
+        let abs = self.checked_path(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -142,7 +191,7 @@ impl Vault {
     /// Создать новый (пустой) файл заметки, создавая родительские папки.
     /// Если файл уже существует — ничего не делает (содержимое не трогается).
     pub fn create(&self, rel: &Path) -> Result<()> {
-        let abs = self.abs_path(rel);
+        let abs = self.checked_path(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -209,7 +258,8 @@ mod tests {
         // скрытая папка пропускается
         vault.create(Path::new(".hidden/d.md")).unwrap();
 
-        let notes = vault.list_notes().unwrap();
+        let (notes, warnings) = vault.list_notes().unwrap();
+        assert!(warnings.is_empty());
         assert_eq!(
             notes,
             vec![
@@ -251,7 +301,10 @@ mod tests {
         vault.create(Path::new("note.md")).unwrap();
         vault.create(Path::new(".secret/inner.md")).unwrap();
 
-        assert_eq!(vault.list_notes().unwrap(), vec![PathBuf::from("note.md")]);
+        assert_eq!(
+            vault.list_notes().unwrap().0,
+            vec![PathBuf::from("note.md")]
+        );
     }
 
     #[test]
@@ -261,7 +314,7 @@ mod tests {
         vault.create(Path::new("b.md")).unwrap();
 
         assert_eq!(
-            vault.list_notes().unwrap(),
+            vault.list_notes().unwrap().0,
             vec![PathBuf::from("A.MD"), PathBuf::from("b.md")]
         );
     }
@@ -303,5 +356,68 @@ mod tests {
         vault.create(Path::new("note.md")).unwrap();
 
         assert_eq!(vault.read(Path::new("note.md")).unwrap(), "важное");
+    }
+
+    fn is_invalid_path<T: std::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(VaultError::InvalidPath(_)))
+    }
+
+    #[test]
+    fn paths_outside_vault_are_rejected() {
+        let (vault, _dir) = temp_vault();
+        assert!(is_invalid_path(vault.read(Path::new("../x.md"))));
+        assert!(is_invalid_path(vault.write(Path::new("../x.md"), "x")));
+        assert!(is_invalid_path(vault.create(Path::new("../../x.md"))));
+        assert!(is_invalid_path(vault.read(Path::new("/etc/x.md"))));
+        assert!(is_invalid_path(vault.write(Path::new("/etc/x.md"), "x")));
+        assert!(is_invalid_path(vault.create(Path::new(""))));
+        #[cfg(windows)]
+        {
+            assert!(is_invalid_path(vault.write(Path::new(r"C:\x.md"), "x")));
+            assert!(is_invalid_path(vault.create(Path::new(r"C:\temp\x.md"))));
+        }
+        // Ничего не создано вне vault.
+        assert!(!std::env::temp_dir().join("x.md").exists());
+    }
+
+    #[test]
+    fn dot_components_inside_vault_are_allowed() {
+        let (vault, dir) = temp_vault();
+        vault.write(Path::new("a/./b.md"), "ok").unwrap();
+        assert_eq!(vault.read(Path::new("a/b.md")).unwrap(), "ok");
+        assert!(dir.join("a").join("b.md").exists());
+    }
+
+    #[test]
+    fn read_lossy_marks_invalid_utf8() {
+        let (vault, dir) = temp_vault();
+        fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        let (text, lossy) = vault.read_lossy(Path::new("bad.md")).unwrap();
+        assert!(lossy, "невалидные байты должны быть отмечены");
+        assert!(!text.is_empty(), "текст читается с заменами");
+        // Строгое чтение по-прежнему падает.
+        assert!(vault.read(Path::new("bad.md")).is_err());
+
+        // Валидный файл — без пометки.
+        vault.write(Path::new("ok.md"), "текст").unwrap();
+        let (text, lossy) = vault.read_lossy(Path::new("ok.md")).unwrap();
+        assert_eq!(text, "текст");
+        assert!(!lossy);
+    }
+
+    #[test]
+    fn list_notes_reports_no_warnings_for_clean_vault() {
+        let (vault, _dir) = temp_vault();
+        vault.create(Path::new("a.md")).unwrap();
+        let (notes, warnings) = vault.list_notes().unwrap();
+        assert_eq!(notes, vec![PathBuf::from("a.md")]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_root_is_an_error() {
+        let dir = std::env::temp_dir().join("mdwriter-no-such-vault-dir");
+        let vault = Vault::open(dir);
+        assert!(vault.list_notes().is_err(), "недоступный корень — ошибка");
     }
 }

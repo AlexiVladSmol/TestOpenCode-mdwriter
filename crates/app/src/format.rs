@@ -83,6 +83,47 @@ pub(crate) fn toggle_task_at(text: &mut String, offset: usize) -> bool {
     true
 }
 
+/// Оборачивает выделение маркерами (`before`/`after`).
+///
+/// Возвращает новый текст и позицию курсора в символах от начала замены:
+/// - выделение уже обёрнуто → маркеры снимаются, курсор в конце текста;
+/// - выделение пустое → курсор ставится **между** маркерами (`**|**`);
+/// - иначе → курсор в конце обёрнутого текста.
+pub(crate) fn wrap_selection_text(sel: &str, before: &str, after: &str) -> (String, usize) {
+    if !sel.is_empty() && sel.starts_with(before) && sel.ends_with(after) {
+        let inner = &sel[before.len()..sel.len() - after.len()];
+        (inner.to_string(), inner.chars().count())
+    } else if sel.is_empty() {
+        let text = format!("{before}{after}");
+        (text, before.chars().count())
+    } else {
+        let text = format!("{before}{sel}{after}");
+        let cursor = text.chars().count();
+        (text, cursor)
+    }
+}
+
+/// Что вставляет кнопка «—». Пустая строка перед `---` обязательна: строка
+/// `---` прямо под текстом по CommonMark делает этот текст заголовком H2
+/// (setext), а не рисует линию.
+const HORIZONTAL_RULE: &str = "\n\n---\n";
+
+/// Вставляет горизонтальную линию после строки, в которой стоит байтовый
+/// `end`, отделяя её пустой строкой. Выделенный текст не изменяется.
+/// Возвращает новый текст и позицию курсора в байтах (сразу после линии).
+pub(crate) fn insert_horizontal_rule(text: &str, end: usize) -> (String, usize) {
+    let end = end.min(text.len());
+    let line_end = text[end..]
+        .find('\n')
+        .map(|p| end + p)
+        .unwrap_or(text.len());
+    let mut out = String::with_capacity(text.len() + HORIZONTAL_RULE.len());
+    out.push_str(&text[..line_end]);
+    out.push_str(HORIZONTAL_RULE);
+    out.push_str(&text[line_end..]);
+    (out, line_end + HORIZONTAL_RULE.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +176,63 @@ mod tests {
         let pos = text.find('b').unwrap();
         let r = lines_range(text, pos, pos);
         assert_eq!(&text[r], "b");
+    }
+
+    // --------- B11: обёртка выделения и горизонтальная линия ---------
+
+    #[test]
+    fn wrap_selection_text_puts_cursor_between_markers_when_empty() {
+        let (text, cursor) = wrap_selection_text("", "**", "**");
+        assert_eq!(text, "****");
+        assert_eq!(cursor, 2, "курсор должен стоять между маркерами");
+    }
+
+    #[test]
+    fn wrap_selection_text_wraps_and_unwraps() {
+        let (text, cursor) = wrap_selection_text("слово", "**", "**");
+        assert_eq!(text, "**слово**");
+        assert_eq!(cursor, text.chars().count());
+
+        let (text, cursor) = wrap_selection_text("**слово**", "**", "**");
+        assert_eq!(text, "слово");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn insert_horizontal_rule_after_the_last_line() {
+        // Линия ставится после строки, в которой стоит курсор; текст не трогаем.
+        let (text, cursor) = insert_horizontal_rule("abc", 1);
+        assert_eq!(text, "abc\n\n---\n");
+        assert_eq!(cursor, 9);
+
+        let (text, cursor) = insert_horizontal_rule("abc\ndef", 1);
+        assert_eq!(text, "abc\n\n---\n\ndef");
+        assert_eq!(cursor, 9);
+
+        // Выделение внутри последней строки — линия всё равно после неё.
+        let (text, _) = insert_horizontal_rule("a\nbb\nc", 4);
+        assert_eq!(text, "a\nbb\n\n---\n\nc");
+    }
+
+    /// Что из вставленного видит парсер: линию или заголовок.
+    fn block_kinds(md: &str) -> Vec<&'static str> {
+        use pulldown_cmark::{Event, Parser, Tag};
+        Parser::new_ext(md, markdown::cmark_options())
+            .filter_map(|e| match e {
+                Event::Rule => Some("rule"),
+                Event::Start(Tag::Heading { .. }) => Some("heading"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inserted_rule_is_a_rule_not_a_setext_heading() {
+        // Регрессия: `abc\n---` — это заголовок H2 «abc», а не линия.
+        assert_eq!(block_kinds("abc\n---\n"), vec!["heading"]);
+        for (text, at) in [("abc", 3), ("abc\ndef", 1), ("a\nbb\nc", 4), ("", 0)] {
+            let (out, _) = insert_horizontal_rule(text, at);
+            assert_eq!(block_kinds(&out), vec!["rule"], "{out:?}");
+        }
     }
 }
