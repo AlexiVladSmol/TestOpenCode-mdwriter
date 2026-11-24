@@ -7,7 +7,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use graph::GraphView;
-use index::Index;
+use index::{Index, NoteChange};
 use vault::{Vault, VaultError, VaultWatcher};
 
 use crate::format::{self, lines_range, toggle_task_at};
@@ -37,6 +37,46 @@ fn rescan_schedule(pending: Option<f64>, changed: bool, now: f64) -> (Option<f64
         Some(t) if now >= t => (None, true),
         p => (p, false),
     }
+}
+
+/// Как применить пачку путей из наблюдателя.
+#[derive(Debug, PartialEq, Eq)]
+enum ChangePlan {
+    /// Полное пересканирование vault.
+    Full,
+    /// Перечитать только эти заметки (пути относительно корня vault).
+    Notes(Vec<PathBuf>),
+}
+
+/// Решает, хватит ли частичного обновления (C3).
+///
+/// Полное пересканирование нужно, если среди путей есть корень (наблюдатель
+/// просит пересканировать всё), путь вне vault, папка, или исчезнувший путь
+/// без расширения `.md` — это могла быть папка с заметками. Изменения
+/// прочих файлов (картинки и т.п.) пропускаются.
+fn plan_changes(root: &Path, changes: &[PathBuf]) -> ChangePlan {
+    let mut notes = Vec::new();
+    for path in changes {
+        if path == root {
+            return ChangePlan::Full;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            return ChangePlan::Full;
+        };
+        let is_md = rel
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+        if path.is_dir() {
+            return ChangePlan::Full;
+        }
+        if is_md {
+            notes.push(rel.to_path_buf());
+        } else if !path.is_file() {
+            return ChangePlan::Full;
+        }
+    }
+    ChangePlan::Notes(notes)
 }
 
 /// Фиксированный id редактора — для доступа к состоянию TextEdit (курсор/выделение).
@@ -98,8 +138,13 @@ pub(crate) struct VaultState {
     pub(crate) conflict: bool,
     /// Файл удалён/переименован извне, а в редакторе есть несохранённые правки.
     pub(crate) orphaned: bool,
-    /// Когда пересканировать vault после событий наблюдателя (см. `poll_watcher`).
+    /// Когда применить накопленные события наблюдателя (см. `poll_watcher`).
     pub(crate) pending_rescan_at: Option<f64>,
+    /// Пути из событий наблюдателя, ещё не применённые к индексу.
+    pending_changes: Vec<PathBuf>,
+    /// Поколение индекса, по которому построен граф (граф обновляется
+    /// лениво — только когда его окно открыто, см. `refresh_graph`).
+    graph_generation: u64,
     /// Предупреждения индекса, о которых уже сообщили (см. `report_index_warnings`).
     reported_index_warnings: Vec<String>,
     pub(crate) last_edit: Option<f64>,
@@ -132,6 +177,8 @@ impl VaultState {
             conflict: false,
             orphaned: false,
             pending_rescan_at: None,
+            pending_changes: Vec::new(),
+            graph_generation: 0,
             reported_index_warnings: Vec::new(),
             last_edit: None,
             new_note_name: String::new(),
@@ -168,8 +215,61 @@ impl VaultState {
             }
         };
         self.report_index_warnings();
-        self.graph.update(&self.index);
         self.check_open_on_disk();
+    }
+
+    /// Применяет изменения из наблюдателя: заметки обновляются в индексе по
+    /// одной (C3), а полное пересканирование — только когда изменилось
+    /// что-то крупнее отдельных заметок (папки, неизвестные пути).
+    pub(crate) fn apply_changes(&mut self, changes: Vec<PathBuf>) {
+        match plan_changes(self.vault.root(), &changes) {
+            ChangePlan::Full => self.rescan(),
+            ChangePlan::Notes(rels) => self.apply_note_changes(&rels),
+        }
+    }
+
+    /// Частичное обновление: перечитываются только заметки `rels`.
+    fn apply_note_changes(&mut self, rels: &[PathBuf]) {
+        if rels.is_empty() {
+            return;
+        }
+        let changes: Vec<NoteChange> = rels
+            .iter()
+            .map(|rel| NoteChange::from_disk(&self.vault, rel))
+            .collect();
+        self.index.apply(changes);
+
+        // Набор заметок (для дерева) меняется только при появлении/удалении.
+        let mut set_changed = false;
+        for rel in rels {
+            let exists = self.vault.abs_path(rel).is_file();
+            match self.notes.binary_search(rel) {
+                Ok(i) if !exists => {
+                    self.notes.remove(i);
+                    set_changed = true;
+                }
+                Err(i) if exists => {
+                    self.notes.insert(i, rel.clone());
+                    set_changed = true;
+                }
+                _ => {}
+            }
+        }
+        if set_changed {
+            self.tree = tree::build_tree(&self.notes);
+        }
+        self.report_index_warnings();
+        self.check_open_on_disk();
+    }
+
+    /// Перестраивает граф, если индекс изменился с прошлого раза. Вызывать
+    /// перед показом окна графа: пока окно закрыто, граф не пересчитывается.
+    pub(crate) fn refresh_graph(&mut self) {
+        let generation = self.index.generation();
+        if self.graph_generation != generation {
+            self.graph.update(&self.index);
+            self.graph_generation = generation;
+        }
     }
 
     /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
@@ -181,10 +281,10 @@ impl VaultState {
     /// же уведомление висело бы постоянно с растущим счётчиком.
     fn report_index_warnings(&mut self) {
         let warnings = self.index.warnings();
-        if warnings == self.reported_index_warnings.as_slice() {
+        if warnings == self.reported_index_warnings {
             return;
         }
-        self.reported_index_warnings = warnings.to_vec();
+        self.reported_index_warnings = warnings.clone();
         if warnings.is_empty() {
             return;
         }
@@ -388,6 +488,15 @@ impl VaultState {
                 self.save_failed = false;
                 self.conflict = false;
                 self.orphaned = false;
+                // Индекс обновляем сразу из буфера (C3): поиск и backlinks
+                // видят правку без чтения с диска. Событие наблюдателя о
+                // этой же записи потом ничего не изменит — текст совпадёт.
+                self.index.upsert(rel.clone(), self.editor_text.clone());
+                if let Err(i) = self.notes.binary_search(&rel) {
+                    // Заметку пересоздали («Сохранить снова» после удаления).
+                    self.notes.insert(i, rel);
+                    self.tree = tree::build_tree(&self.notes);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -471,14 +580,20 @@ impl VaultState {
         }
     }
 
-    /// Забирает события наблюдателя за файлами и пересканирует vault через
-    /// `RESCAN_DELAY` после первого из них. Вызывать раз в кадр.
+    /// Забирает события наблюдателя за файлами и через `RESCAN_DELAY` после
+    /// первого из них применяет всё накопленное (`apply_changes`). Вызывать
+    /// раз в кадр.
     pub(crate) fn poll_watcher(&mut self, now: f64, ctx: &egui::Context) {
-        let changed = !self.watcher.take_changes().is_empty();
+        let changes = self.watcher.take_changes();
+        let changed = !changes.is_empty();
+        self.pending_changes.extend(changes);
         let (pending, due) = rescan_schedule(self.pending_rescan_at, changed, now);
         self.pending_rescan_at = pending;
         if due {
-            self.rescan();
+            let mut changes = std::mem::take(&mut self.pending_changes);
+            changes.sort();
+            changes.dedup();
+            self.apply_changes(changes);
         } else if let Some(t) = pending {
             // Кадр нужен к назначенному времени, даже если пользователь бездействует.
             ctx.request_repaint_after(Duration::from_secs_f64((t - now).max(0.0)));
@@ -1389,6 +1504,128 @@ mod tests {
         vs.poll_watcher(RESCAN_DELAY, &ctx);
         assert_eq!(vs.pending_rescan_at, None);
         assert_eq!(vs.editor_text, "извне");
+    }
+
+    // ------------- C3: частичное обновление индекса -------------
+
+    #[test]
+    fn c3_plan_changes_classifies_paths() {
+        let (_vs, root) = open_a();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("pic.png"), "png").unwrap();
+        let p = |s: &str| root.join(s);
+
+        // Заметки — существующие и исчезнувшие — перечитываются по одной.
+        assert_eq!(
+            plan_changes(&root, &[p("a.md"), p("нет.md"), p("pic.png")]),
+            ChangePlan::Notes(vec![PathBuf::from("a.md"), PathBuf::from("нет.md")])
+        );
+        // Корень (наблюдатель просит пересканировать всё), папка, исчезнувший
+        // путь без .md (могла быть папка) и путь вне vault — полное.
+        assert_eq!(
+            plan_changes(&root, std::slice::from_ref(&root)),
+            ChangePlan::Full
+        );
+        assert_eq!(plan_changes(&root, &[p("sub")]), ChangePlan::Full);
+        assert_eq!(
+            plan_changes(&root, &[p("удалённая-папка")]),
+            ChangePlan::Full
+        );
+        assert_eq!(
+            plan_changes(&root, &[std::env::temp_dir().join("x.md")]),
+            ChangePlan::Full
+        );
+    }
+
+    #[test]
+    fn c3_external_note_added_and_removed_incrementally() {
+        let (mut vs, dir) = open_a();
+        let g = vs.index.generation();
+
+        std::fs::write(dir.join("b.md"), "ссылка на [[a]]").unwrap();
+        vs.apply_changes(vec![dir.join("b.md")]);
+        assert!(vs.index.contains(Path::new("b.md")));
+        assert_eq!(vs.notes, vec![PathBuf::from("a.md"), PathBuf::from("b.md")]);
+        assert_eq!(
+            vs.index.backlinks(Path::new("a.md")),
+            vec![PathBuf::from("b.md")]
+        );
+        assert_ne!(vs.index.generation(), g);
+        assert_eq!(vs.tree.len(), 2, "дерево обновлено");
+
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        vs.apply_changes(vec![dir.join("b.md")]);
+        assert!(!vs.index.contains(Path::new("b.md")));
+        assert_eq!(vs.notes, vec![PathBuf::from("a.md")]);
+        assert!(vs.index.backlinks(Path::new("a.md")).is_empty());
+    }
+
+    #[test]
+    fn c3_save_updates_index_without_rescan() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("b.md"), "цель").unwrap();
+        vs.rescan();
+
+        edit(&mut vs, "теперь ссылается на [[b]]");
+        vs.flush().unwrap();
+        // Индекс уже знает о правке — поиск и backlinks без пересканирования.
+        assert_eq!(
+            vs.index.backlinks(Path::new("b.md")),
+            vec![PathBuf::from("a.md")]
+        );
+        assert_eq!(vs.index.search("ссылается", 10).len(), 1);
+
+        // Событие наблюдателя о нашей же записи ничего не меняет.
+        let g = vs.index.generation();
+        vs.apply_changes(vec![dir.join("a.md")]);
+        assert_eq!(vs.index.generation(), g);
+        assert!(!vs.conflict && !vs.dirty);
+    }
+
+    #[test]
+    fn c3_graph_is_rebuilt_lazily() {
+        let (mut vs, dir) = open_a();
+        // Пока окно графа не открывали, граф не строился.
+        assert_eq!(vs.graph.node_count(), 0);
+        vs.refresh_graph();
+        assert_eq!(vs.graph.node_count(), 1);
+
+        std::fs::write(dir.join("b.md"), "[[a]]").unwrap();
+        vs.apply_changes(vec![dir.join("b.md")]);
+        // Индекс изменился, граф — нет, пока его не попросили.
+        assert_eq!(vs.graph.node_count(), 1);
+        vs.refresh_graph();
+        assert_eq!(vs.graph.node_count(), 2);
+        assert_eq!(vs.graph.edge_pairs().len(), 1);
+    }
+
+    /// Замер «до/после» (не входит в обычный прогон):
+    /// `cargo test -p mdwriter --release -- --ignored --nocapture c3_timing`
+    #[test]
+    #[ignore]
+    fn c3_timing() {
+        use std::time::Instant;
+        let (mut vs, dir) = open_a();
+        for i in 0..2000 {
+            let text = format!(
+                "# {i}\nсм. [[n{}]] и [[n{}]]\n",
+                (i * 7) % 2000,
+                (i * 13) % 2000
+            );
+            std::fs::write(dir.join(format!("n{i}.md")), text).unwrap();
+        }
+        let t = Instant::now();
+        vs.rescan();
+        let full = t.elapsed();
+
+        std::fs::write(dir.join("n5.md"), "изменено [[n6]]").unwrap();
+        let t = Instant::now();
+        vs.apply_changes(vec![dir.join("n5.md")]);
+        let partial = t.elapsed();
+        assert_eq!(vs.index.backlinks(Path::new("n6.md")).len(), 3);
+        println!(
+            "2001 заметка: полное пересканирование {full:?}, одна изменённая заметка {partial:?}"
+        );
     }
 
     // ------------------- B2: переключение задач -------------------
