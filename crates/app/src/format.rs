@@ -66,6 +66,42 @@ pub(crate) fn fmt_quote(line: &str) -> String {
     }
 }
 
+/// Оборачивает выделение маркерами (`before`/`after`).
+///
+/// Возвращает новый текст и позицию курсора в символах от начала замены:
+/// - выделение уже обёрнуто → маркеры снимаются, курсор в конце текста;
+/// - выделение пустое → курсор ставится **между** маркерами (`**|**`);
+/// - иначе → курсор в конце обёрнутого текста.
+pub(crate) fn wrap_selection_text(sel: &str, before: &str, after: &str) -> (String, usize) {
+    if !sel.is_empty() && sel.starts_with(before) && sel.ends_with(after) {
+        let inner = &sel[before.len()..sel.len() - after.len()];
+        (inner.to_string(), inner.chars().count())
+    } else if sel.is_empty() {
+        let text = format!("{before}{after}");
+        (text, before.chars().count())
+    } else {
+        let text = format!("{before}{sel}{after}");
+        let cursor = text.chars().count();
+        (text, cursor)
+    }
+}
+
+/// Вставляет горизонтальную линию `\n---\n` после строки, в которой стоит
+/// байтовый `end`. Выделенный текст не изменяется.
+/// Возвращает новый текст и позицию курсора в байтах.
+pub(crate) fn insert_horizontal_rule(text: &str, end: usize) -> (String, usize) {
+    let end = end.min(text.len());
+    let line_end = text[end..]
+        .find('\n')
+        .map(|p| end + p)
+        .unwrap_or(text.len());
+    let mut out = String::with_capacity(text.len() + 5);
+    out.push_str(&text[..line_end]);
+    out.push_str("\n---\n");
+    out.push_str(&text[line_end..]);
+    (out, line_end + 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +133,41 @@ mod tests {
         let pos = text.find('b').unwrap();
         let r = lines_range(text, pos, pos);
         assert_eq!(&text[r], "b");
+    }
+
+    // --------- B11: обёртка выделения и горизонтальная линия ---------
+
+    #[test]
+    fn wrap_selection_text_puts_cursor_between_markers_when_empty() {
+        let (text, cursor) = wrap_selection_text("", "**", "**");
+        assert_eq!(text, "****");
+        assert_eq!(cursor, 2, "курсор должен стоять между маркерами");
+    }
+
+    #[test]
+    fn wrap_selection_text_wraps_and_unwraps() {
+        let (text, cursor) = wrap_selection_text("слово", "**", "**");
+        assert_eq!(text, "**слово**");
+        assert_eq!(cursor, text.chars().count());
+
+        let (text, cursor) = wrap_selection_text("**слово**", "**", "**");
+        assert_eq!(text, "слово");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn insert_horizontal_rule_after_the_last_line() {
+        // Линия ставится после строки, в которой стоит курсор; текст не трогаем.
+        let (text, cursor) = insert_horizontal_rule("abc", 1);
+        assert_eq!(text, "abc\n---\n");
+        assert_eq!(cursor, 8);
+
+        let (text, cursor) = insert_horizontal_rule("abc\ndef", 1);
+        assert_eq!(text, "abc\n---\n\ndef");
+        assert_eq!(cursor, 8);
+
+        // Выделение внутри последней строки — линия всё равно после неё.
+        let (text, _) = insert_horizontal_rule("a\nbb\nc", 4);
+        assert_eq!(text, "a\nbb\n---\n\nc");
     }
 }

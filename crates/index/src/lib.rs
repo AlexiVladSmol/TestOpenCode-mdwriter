@@ -41,18 +41,41 @@ pub struct Index {
     backlinks: HashMap<PathBuf, Vec<PathBuf>>,
     /// Номер поколения: меняется при каждом изменении индекса.
     generation: u64,
+    /// Проблемы последнего построения: пропущенные/нечитаемые файлы.
+    warnings: Vec<String>,
 }
 
 impl Index {
     /// Читает все заметки vault и строит индекс.
+    ///
+    /// Файлы, которые не удаётся прочитать, и файлы не в UTF-8 не прерывают
+    /// построение: они попадают в [`Index::warnings`], а текст читается с
+    /// заменами (поиск и ссылки продолжают работать).
     pub fn build(vault: &Vault) -> Result<Index> {
         let mut index = Index::default();
-        for rel in vault.list_notes()? {
-            let text = vault.read(&rel)?;
-            index.add_note(rel, text);
+        let (notes, mut warnings) = vault.list_notes()?;
+        for rel in notes {
+            match vault.read_lossy(&rel) {
+                Ok((text, had_invalid_bytes)) => {
+                    if had_invalid_bytes {
+                        warnings.push(format!(
+                            "{}: не UTF-8, текст прочитан с заменами",
+                            rel.display()
+                        ));
+                    }
+                    index.add_note(rel, text);
+                }
+                Err(e) => warnings.push(format!("{}: {e}", rel.display())),
+            }
         }
+        index.warnings = warnings;
         index.rebuild_derived();
         Ok(index)
+    }
+
+    /// Предупреждения последнего [`Index::build`]: пропущенные и битые файлы.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Добавляет (или заменяет) заметку без пересчёта производных данных.
@@ -343,6 +366,25 @@ mod tests {
         assert!(index
             .resolve_wikilink(Path::new("root.md"), "нет")
             .is_none());
+    }
+
+    #[test]
+    fn build_survives_file_with_invalid_utf8() {
+        let (vault, dir) = test_vault();
+        vault.write(Path::new("good.md"), "пони живут тут").unwrap();
+        // Байты, не являющиеся UTF-8 (например, файл в CP1251).
+        std::fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+
+        let index = Index::build(&vault).expect("один плохой файл не ломает индекс");
+        assert_eq!(index.len(), 2);
+        assert!(index.title(Path::new("bad.md")).is_some());
+        // Поиск по обычной заметке работает.
+        let hits = index.search("пони", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, PathBuf::from("good.md"));
+        // О проблемном файле сообщается предупреждением.
+        assert_eq!(index.warnings().len(), 1);
+        assert!(index.warnings()[0].contains("bad.md"));
     }
 
     #[test]
