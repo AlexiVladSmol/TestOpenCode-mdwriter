@@ -80,14 +80,21 @@ impl Index {
 
     /// Добавляет (или заменяет) заметку без пересчёта производных данных.
     fn add_note(&mut self, rel: PathBuf, text: String) {
-        let fm = markdown::split_frontmatter(&text).map(|(fm, _)| fm);
+        let (fm, body) = match markdown::split_frontmatter(&text) {
+            Some((fm, body)) => (Some(fm), body),
+            None => (None, text.as_str()),
+        };
 
         let title = fm
             .as_ref()
             .and_then(|f| f.title.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| default_title(&rel));
-        let tags = fm.as_ref().map(|f| f.tags.clone()).unwrap_or_default();
+        // Теги — из frontmatter и из текста (`#тег`), B13.
+        let tags = merge_tags(
+            fm.as_ref().map(|f| f.tags.clone()).unwrap_or_default(),
+            markdown::extract_tags(body),
+        );
         let links_out: Vec<String> = markdown::extract_wikilinks(&text)
             .into_iter()
             .map(|w| w.target)
@@ -165,6 +172,23 @@ impl Index {
 
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty()
+    }
+
+    /// Заметки с тегом (без учёта регистра и без `#`), отсортированы по пути.
+    pub fn notes_with_tag(&self, tag: &str) -> Vec<PathBuf> {
+        let tag = tag.trim().trim_start_matches('#');
+        if tag.is_empty() {
+            return Vec::new();
+        }
+        let wanted = tag.to_lowercase();
+        let mut notes: Vec<PathBuf> = self
+            .notes
+            .iter()
+            .filter(|(_, meta)| meta.tags.iter().any(|t| t.to_lowercase() == wanted))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        notes.sort();
+        notes
     }
 
     pub fn meta(&self, rel: &Path) -> Option<&NoteMeta> {
@@ -265,6 +289,25 @@ impl Index {
     }
 }
 
+/// Объединяет теги frontmatter и инлайн-теги `#tag` из текста: без учёта
+/// регистра, без дублей, порядок — первое появление (frontmatter идёт первым).
+fn merge_tags(frontmatter: Vec<String>, inline: Vec<String>) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in frontmatter.into_iter().chain(inline) {
+        let tag = tag.trim().trim_start_matches('#').trim().to_string();
+        if tag.is_empty() {
+            continue;
+        }
+        // Сравнение без учёта регистра — регистронезависимое и для кириллицы
+        // (`eq_ignore_ascii_case` знает только латиницу).
+        if tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+            continue;
+        }
+        tags.push(tag);
+    }
+    tags
+}
+
 fn default_title(rel: &Path) -> String {
     rel.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -312,6 +355,65 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         (Vault::open(dir.clone()), dir)
+    }
+
+    /// B13: теги берутся и из frontmatter, и из текста (`#тег`), без дублей
+    /// и без учёта регистра; порядок — первое появление.
+    #[test]
+    fn inline_tags_are_indexed_and_merged() {
+        let (vault, _dir) = test_vault();
+        vault
+            .write(
+                Path::new("a.md"),
+                "---\ntags: [проект, Понятия]\n---\nТекст #понятия и #дом/кухня, а это#нет\n",
+            )
+            .unwrap();
+
+        let index = Index::build(&vault).unwrap();
+        let tags = &index.meta(Path::new("a.md")).unwrap().tags;
+        assert_eq!(tags, &["проект", "Понятия", "дом/кухня"], "{tags:?}");
+    }
+
+    /// B13: поиск заметок по тегу — без учёта регистра, `#` необязателен.
+    #[test]
+    fn notes_with_tag_is_case_insensitive() {
+        let (vault, _dir) = test_vault();
+        vault
+            .write(Path::new("a.md"), "---\ntags: [Пони]\n---\nтекст\n")
+            .unwrap();
+        vault
+            .write(Path::new("b.md"), "Обычный текст #пони\n")
+            .unwrap();
+        vault
+            .write(Path::new("c.md"), "Без тегов, только #другое\n")
+            .unwrap();
+
+        let index = Index::build(&vault).unwrap();
+        assert_eq!(
+            index.notes_with_tag("ПОНИ"),
+            vec![PathBuf::from("a.md"), PathBuf::from("b.md")]
+        );
+        assert_eq!(index.notes_with_tag("#пони").len(), 2);
+        assert_eq!(index.notes_with_tag("другое"), vec![PathBuf::from("c.md")]);
+        assert!(index.notes_with_tag("").is_empty());
+        assert!(index.notes_with_tag("нет-такого").is_empty());
+    }
+
+    /// Теги во frontmatter без инлайн-тегов индексируются как раньше.
+    #[test]
+    fn frontmatter_tags_still_work() {
+        let (vault, _dir) = test_vault();
+        vault
+            .write(
+                Path::new("a.md"),
+                "---\ntags: [один, два]\n---\nбез тегов\n",
+            )
+            .unwrap();
+        let index = Index::build(&vault).unwrap();
+        assert_eq!(
+            index.meta(Path::new("a.md")).unwrap().tags,
+            vec!["один".to_string(), "два".to_string()]
+        );
     }
 
     #[test]
