@@ -51,6 +51,75 @@ pub fn parse_link_target(raw: &str) -> LinkTarget<'_> {
     }
 }
 
+/// Общие опции pulldown-cmark для предпросмотра и экспорта.
+pub fn cmark_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
+    options.insert(Options::ENABLE_MATH);
+    options
+}
+
+/// Строка-«ограда» блока кода (```` ``` ```` или `~~~`, с любым отступом).
+pub fn is_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// Заменяет `[[target|alias]]` на `[alias](<url(target)>)` в тексте вне кода.
+///
+/// Угловые скобки вокруг адреса нужны, чтобы ссылки с пробелами оставались
+/// ссылками по CommonMark. Ссылки с `<`, `>` или переводом строки в цели
+/// остаются исходным текстом.
+pub fn wikilinks_to_md(text: &str, url: impl Fn(&str) -> String) -> String {
+    let links = extract_wikilinks(text);
+    if links.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for w in links {
+        out.push_str(&text[last..w.range.start]);
+        match wikilink_md(&w, &url) {
+            Some(md) => out.push_str(&md),
+            None => out.push_str(&text[w.range.clone()]),
+        }
+        last = w.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Одна wikilink в виде markdown-ссылки; `None`, если цель нельзя положить
+/// в адрес (содержит `<`, `>` или перевод строки).
+fn wikilink_md(w: &Wikilink, url: &impl Fn(&str) -> String) -> Option<String> {
+    if w.target.contains(['<', '>', '\n', '\r']) {
+        return None;
+    }
+    let label = w.alias.as_deref().unwrap_or(&w.target);
+    Some(format!(
+        "[{}](<{}>)",
+        escape_link_label(label),
+        url(&w.target)
+    ))
+}
+
+/// Экранирует символы, ломающие текст ссылки: `\`, `[`, `]`.
+fn escape_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Отделяет frontmatter от тела документа.
 /// Возвращает `None`, если документ не начинается с закрытой YAML-шапки.
 ///
@@ -246,8 +315,7 @@ fn for_each_text_run(text: &str, mut f: impl FnMut(&str, usize)) {
         let line = raw_line.trim_end_matches(['\n', '\r']);
         let line_offset = offset;
 
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if is_fence_line(line) {
             // Упрощение: любая строка-«ограда» переключает состояние.
             in_fence = !in_fence;
         } else if !in_fence {
@@ -465,6 +533,57 @@ mod tests {
         let text = "#снаружи\n\n```\n#внутри\n```\n\n`#винлайн`\n";
         let tags = extract_tags(text);
         assert_eq!(tags, vec!["снаружи"]);
+    }
+
+    #[test]
+    fn fence_detector_matches_backticks_and_tildes() {
+        assert!(is_fence_line("```"));
+        assert!(is_fence_line("```rust"));
+        assert!(is_fence_line("  ~~~"));
+        assert!(!is_fence_line("текст ``` внутри"));
+        assert!(!is_fence_line(""));
+    }
+
+    #[test]
+    fn cmark_options_enable_gfm_extensions() {
+        let options = cmark_options();
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_TASKLISTS));
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_TABLES));
+        assert!(options.contains(pulldown_cmark::Options::ENABLE_GFM));
+    }
+
+    #[test]
+    fn wikilinks_to_md_uses_callback_url() {
+        let md = wikilinks_to_md(
+            "См. [[Заметка]] и [[Другая|алиас]].",
+            |t| format!("wiki:{t}"),
+        );
+        assert_eq!(
+            md,
+            "См. [Заметка](<wiki:Заметка>) и [алиас](<wiki:Другая>)."
+        );
+    }
+
+    #[test]
+    fn wikilinks_to_md_label_escapes_brackets() {
+        // Алиас со скобкой нельзя получить из текста (extract_wikilinks закрывает
+        // ссылку на первом `]]`), поэтому проверяем сборку ссылки напрямую.
+        let w = Wikilink {
+            target: "Цель".into(),
+            alias: Some("алиас с ] скобкой".into()),
+            embed: false,
+            range: 0..0,
+        };
+        assert_eq!(
+            wikilink_md(&w, &|t: &str| format!("wiki:{t}")).unwrap(),
+            "[алиас с \\] скобкой](<wiki:Цель>)"
+        );
+    }
+
+    #[test]
+    fn wikilinks_to_md_keeps_angle_bracket_targets() {
+        let md = wikilinks_to_md("[[a<b]] и [[ok]]", |t| format!("wiki:{t}"));
+        assert!(md.starts_with("[[a<b]] и "));
     }
 
     #[test]

@@ -803,13 +803,7 @@ impl App {
             return;
         };
 
-        let mut options = pulldown_cmark::Options::empty();
-        options.insert(pulldown_cmark::Options::ENABLE_TABLES);
-        options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
-        options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-        options.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
-        options.insert(pulldown_cmark::Options::ENABLE_GFM);
-        options.insert(pulldown_cmark::Options::ENABLE_MATH);
+        let options = markdown::cmark_options();
 
         let mut html = String::from(
             "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>",

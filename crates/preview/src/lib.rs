@@ -9,9 +9,7 @@ use std::iter::Peekable;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Margin, RichText, Stroke, TextStyle, Ui};
-use pulldown_cmark::{
-    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 
 /// Действие, которое пользователь запросил в предпросмотре.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +33,7 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
         render_frontmatter(ui, fm);
     }
 
-    let body = wiki_links_to_md(body);
+    let body = wiki_to_md(body);
     let task_lines = collect_task_lines(&body);
     let mut task_counter = 0usize;
     let mut block_counter = 0usize;
@@ -51,52 +49,9 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
 }
 
 /// Заменяет `[[target|alias]]` на `[alias](<wiki:target>)` в тексте вне кода.
-/// Угловые скобки вокруг адреса нужны, чтобы ссылки с пробелами оставались
-/// ссылками по CommonMark. Ссылки с `<`, `>` или переводом строки в цели
-/// остаются исходным текстом.
-fn wiki_links_to_md(text: &str) -> String {
-    let links = markdown::extract_wikilinks(text);
-    if links.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for w in links {
-        out.push_str(&text[last..w.range.start]);
-        match wiki_link_md(&w) {
-            Some(md) => out.push_str(&md),
-            None => out.push_str(&text[w.range.clone()]),
-        }
-        last = w.range.end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-/// Одна wikilink в виде markdown-ссылки; `None`, если цель нельзя положить
-/// в адрес (содержит `<`, `>` или перевод строки).
-fn wiki_link_md(w: &markdown::Wikilink) -> Option<String> {
-    if w.target.contains(['<', '>', '\n', '\r']) {
-        return None;
-    }
-    let label = w.alias.as_deref().unwrap_or(&w.target);
-    Some(format!(
-        "[{}](<wiki:{}>)",
-        escape_link_label(label),
-        w.target
-    ))
-}
-
-/// Экранирует символы, ломающие текст ссылки: `\`, `[`, `]`.
-fn escape_link_label(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
-    for c in label.chars() {
-        if matches!(c, '\\' | '[' | ']') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+/// Сама сборка ссылки живёт в крейте `markdown` (общая с экспортом).
+fn wiki_to_md(text: &str) -> String {
+    markdown::wikilinks_to_md(text, |target| format!("wiki:{target}"))
 }
 
 /// Строки-задачи (`- [ ]`, `* [x]`, `1. [ ]` и т.п.) вне огороженных блоков.
@@ -106,7 +61,7 @@ fn collect_task_lines(body: &str) -> Vec<usize> {
     let mut in_fence = false;
     for (i, raw) in body.lines().enumerate() {
         let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if markdown::is_fence_line(raw) {
             in_fence = !in_fence;
             continue;
         }
@@ -163,14 +118,7 @@ fn render_body(
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
 ) {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_GFM); // GFM-алерты (callouts)
-    options.insert(Options::ENABLE_MATH);
-    let parser = Parser::new_ext(md, options);
+    let parser = Parser::new_ext(md, markdown::cmark_options());
     render_blocks(
         ui,
         &mut parser.peekable(),
@@ -1009,7 +957,7 @@ mod tests {
 
     #[test]
     fn wiki_links_transformed() {
-        let md = wiki_links_to_md("См. [[Заметка]] и [[Другая|алиас]].");
+        let md = wiki_to_md("См. [[Заметка]] и [[Другая|алиас]].");
         assert_eq!(
             md,
             "См. [Заметка](<wiki:Заметка>) и [алиас](<wiki:Другая>)."
@@ -1018,10 +966,7 @@ mod tests {
 
     /// Адреса ссылок, которые реально видит парсер markdown.
     fn link_dests(md: &str) -> Vec<String> {
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TABLES);
-        options.insert(Options::ENABLE_TASKLISTS);
-        Parser::new_ext(md, options)
+        Parser::new_ext(md, markdown::cmark_options())
             .filter_map(|e| match e {
                 Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.to_string()),
                 _ => None,
@@ -1031,49 +976,33 @@ mod tests {
 
     #[test]
     fn wiki_links_with_spaces_are_real_links() {
-        let md = wiki_links_to_md("См. [[Моя заметка]].");
+        let md = wiki_to_md("См. [[Моя заметка]].");
         assert_eq!(link_dests(&md), vec!["wiki:Моя заметка"]);
     }
 
     #[test]
-    fn wiki_link_label_escapes_brackets() {
-        let w = markdown::Wikilink {
-            target: "Цель".into(),
-            alias: Some("алиас с ] скобкой".into()),
-            embed: false,
-            range: 0..0,
-        };
-        assert_eq!(
-            wiki_link_md(&w).unwrap(),
-            "[алиас с \\] скобкой](<wiki:Цель>)"
-        );
-    }
-
-    #[test]
     fn wiki_link_target_with_anchor() {
-        let md = wiki_links_to_md("[[Моя заметка#Заголовок]]");
+        let md = wiki_to_md("[[Моя заметка#Заголовок]]");
         assert_eq!(link_dests(&md), vec!["wiki:Моя заметка#Заголовок"]);
     }
 
     #[test]
     fn wiki_link_with_angle_brackets_is_kept_as_text() {
-        let md = wiki_links_to_md("[[a<b]] и [[ok]]");
+        let md = wiki_to_md("[[a<b]] и [[ok]]");
         assert!(md.starts_with("[[a<b]] и "));
         assert_eq!(link_dests(&md).len(), 1);
     }
 
     #[test]
     fn wiki_links_untouched_in_code() {
-        let md = wiki_links_to_md("`[[не ссылка]]`");
+        let md = wiki_to_md("`[[не ссылка]]`");
         assert_eq!(md, "`[[не ссылка]]`");
     }
 
     #[test]
     fn ordered_task_list_marker() {
         let md = "1. [ ] один\n2. [x] два\n- [ ] три\n";
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TASKLISTS);
-        let parser = Parser::new_ext(md, options);
+        let parser = Parser::new_ext(md, markdown::cmark_options());
         let markers: Vec<bool> = parser
             .filter_map(|e| match e {
                 Event::TaskListMarker(b) => Some(b),
@@ -1094,9 +1023,7 @@ mod tests {
     #[test]
     fn tables_parse() {
         let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TABLES);
-        let parser = Parser::new_ext(md, options);
+        let parser = Parser::new_ext(md, markdown::cmark_options());
         let tags: Vec<_> = parser
             .filter_map(|e| match e {
                 Event::Start(t) => Some(t),
