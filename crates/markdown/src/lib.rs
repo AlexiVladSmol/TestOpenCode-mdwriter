@@ -30,7 +30,13 @@ pub struct Wikilink {
 
 /// Отделяет frontmatter от тела документа.
 /// Возвращает `None`, если документ не начинается с закрытой YAML-шапки.
+///
+/// Поддерживается: UTF-8 BOM в начале файла, парные кавычки вокруг значений,
+/// теги в виде `tags: a, b`, `tags: [a, b]`, многострочного списка
+/// (`tags:` + строки `  - a`), а также одиночного ключа `tag`.
 pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
+    // BOM от редакторов Windows не должен мешать распознать шапку.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut iter = text.split_inclusive('\n');
     let first = iter.next()?;
     if first.trim() != "---" {
@@ -40,6 +46,8 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
     let mut fm = Frontmatter::default();
     let mut consumed = first.len();
     let mut closed = false;
+    // Последний ключ верхнего уровня — к нему относятся строки-продолжения списка.
+    let mut last_key: Option<String> = None;
     for line in iter {
         if line.trim() == "---" {
             consumed += line.len();
@@ -48,22 +56,37 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
         }
         consumed += line.len();
         let line = line.trim_end_matches(['\n', '\r']);
+
+        // Строка-продолжение YAML-списка: `  - значение`.
+        if let Some(item) = list_item(line) {
+            let item = unquote(item);
+            if !item.is_empty() {
+                if let Some(key) = last_key.as_deref() {
+                    if is_tags_key(key) {
+                        push_tag(&mut fm.tags, &item);
+                    }
+                }
+            }
+            continue;
+        }
+
         if let Some((k, v)) = line.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
+            let k = k.trim();
+            let v = v.trim();
             if k.is_empty() {
                 continue;
             }
+            let value = unquote(v);
             if k == "title" {
-                fm.title = Some(v.to_string());
+                fm.title = Some(value.clone());
             }
-            if k == "tags" {
-                fm.tags = v
-                    .split(',')
-                    .map(|s| s.trim().trim_start_matches('#').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+            if is_tags_key(k) {
+                for tag in parse_tag_value(v) {
+                    push_tag(&mut fm.tags, &tag);
+                }
             }
-            fm.pairs.push((k.to_string(), v.to_string()));
+            fm.pairs.push((k.to_string(), value));
+            last_key = Some(k.to_string());
         }
     }
 
@@ -71,6 +94,57 @@ pub fn split_frontmatter(text: &str) -> Option<(Frontmatter, &str)> {
         Some((fm, &text[consumed..]))
     } else {
         None
+    }
+}
+
+/// Снимает парные кавычки (`"…"` / `'…'`) вокруг значения.
+fn unquote(value: &str) -> String {
+    let v = value.trim();
+    for q in ['"', '\''] {
+        if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
+            return v[1..v.len() - 1].to_string();
+        }
+    }
+    v.to_string()
+}
+
+/// `tag` и `tags` — оба задают теги заметки.
+fn is_tags_key(key: &str) -> bool {
+    key == "tags" || key == "tag"
+}
+
+/// Строка-продолжение списка: отступ + `- значение`.
+fn list_item(line: &str) -> Option<&str> {
+    let indented = line.starts_with(' ') || line.starts_with('\t');
+    if !indented {
+        return None;
+    }
+    let rest = line.trim_start().strip_prefix('-')?;
+    Some(rest.trim())
+}
+
+/// Теги из значения: `a, b`, `[a, b]`, `#a` (с необязательным `#`).
+fn parse_tag_value(value: &str) -> Vec<String> {
+    let v = value.trim();
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(v);
+    inner
+        .split(',')
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Добавляет тег, отбрасывая `#` и дубликаты (порядок — первое появление).
+fn push_tag(tags: &mut Vec<String>, raw: &str) {
+    let tag = raw.trim().trim_start_matches('#');
+    if tag.is_empty() {
+        return;
+    }
+    if !tags.iter().any(|t| t == tag) {
+        tags.push(tag.to_string());
     }
 }
 
@@ -261,6 +335,48 @@ mod tests {
     fn frontmatter_absent_or_unclosed() {
         assert!(split_frontmatter("# Просто текст\n").is_none());
         assert!(split_frontmatter("---\ntitle: X\nнезакрыто\n").is_none());
+    }
+
+    #[test]
+    fn frontmatter_bom_is_skipped() {
+        let text = "\u{FEFF}---\ntitle: X\n---\nBody\n";
+        let (fm, body) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.title.as_deref(), Some("X"));
+        assert_eq!(body, "Body\n");
+    }
+
+    #[test]
+    fn frontmatter_strips_paired_quotes() {
+        let text = "---\ntitle: \"Заметка\"\nalias: 'одинарные'\nplain: без кавычек\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.title.as_deref(), Some("Заметка"));
+        assert_eq!(fm.pairs[1], ("alias".to_string(), "одинарные".to_string()));
+        assert_eq!(
+            fm.pairs[2],
+            ("plain".to_string(), "без кавычек".to_string())
+        );
+    }
+
+    #[test]
+    fn frontmatter_tags_square_brackets() {
+        let text = "---\ntags: [a, \"b c\", #d]\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["a", "b c", "d"]);
+    }
+
+    #[test]
+    fn frontmatter_tags_multiline_list() {
+        let text = "---\ntitle: T\ntags:\n  - a\n  - \"b c\"\n---\nBody";
+        let (fm, body) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["a", "b c"]);
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn frontmatter_tag_singular_key() {
+        let text = "---\ntag: одиночный\n---\n";
+        let (fm, _) = split_frontmatter(text).unwrap();
+        assert_eq!(fm.tags, vec!["одиночный"]);
     }
 
     #[test]

@@ -81,7 +81,7 @@
 | B9 | P2 | Экспорт HTML из буфера, с wikilinks | D2 | DeepSeek | 3 | [ ] |
 | B10 | P2 | Нумерация строк совпадает с текстом | — | DeepSeek | 3 | [ ] |
 | B11 | P2 | Мелкие UX-баги редактора и предпросмотра | — | DeepSeek | 3 | [ ] |
-| B12 | P2 | Frontmatter: BOM, кавычки, YAML-списки | — | DeepSeek | 1 | [ ] |
+| B12 | P2 | Frontmatter: BOM, кавычки, YAML-списки | — | DeepSeek | 1 | [x] |
 | B13 | P3 | Индексировать инлайн-теги `#tag` | B12 | DeepSeek | 4 | [ ] |
 | C1 | P1 | Предвычисленные связи и backlinks в индексе | B3 | Claude | 2 | [ ] |
 | C2 | P1 | Поиск: кеш и корректные сниппеты | C1 | DeepSeek | 4 | [ ] |
