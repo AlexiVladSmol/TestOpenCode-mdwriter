@@ -52,6 +52,8 @@ struct App {
     notices: Notices,
     /// Контекст egui: через него наблюдатель за файлами будит окно.
     ctx: egui::Context,
+    /// Открытая модалка выбора папки (vault или экспорт).
+    picker: Option<ui::folder_picker::Picker>,
 }
 
 /// Колбэк для наблюдателя: из фонового потока просит перерисовать окно,
@@ -85,6 +87,7 @@ impl App {
             settings_dirty: false,
             notices: Notices::default(),
             ctx: cc.egui_ctx.clone(),
+            picker: None,
         };
 
         // Восстанавливаем последний vault.
@@ -113,34 +116,51 @@ impl App {
         app
     }
 
-    fn open_vault(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            // Перед сменой vault дописываем несохранённую заметку старого vault.
-            // Если сохранить не удалось ни в файл, ни копией — остаёмся,
-            // иначе правки пропадут вместе со старым VaultState.
-            if let Some(vs) = &mut self.vault {
-                if vs.flush_or_copy().is_err() {
-                    self.notices.error(
-                        "Vault не сменён: не удалось сохранить открытую заметку".to_string(),
-                    );
-                    return;
-                }
+    /// Открывает модалку выбора папки (вместо системного диалога).
+    fn start_vault_picker(&mut self) {
+        let start = self.start_dir();
+        self.picker = Some(ui::folder_picker::Picker::open_vault(start));
+    }
+
+    /// Папка, с которой начинается просмотр: корень открытого vault, затем
+    /// последний сохранённый vault, затем домашняя папка.
+    fn start_dir(&self) -> PathBuf {
+        if let Some(vs) = &self.vault {
+            return vs.vault.root().to_path_buf();
+        }
+        if let Some(last) = &self.settings.last_vault {
+            if last.is_dir() {
+                return last.clone();
             }
-            match VaultWatcher::new(&path, repaint_on_change(&self.ctx)) {
-                Ok(watcher) => {
-                    let mut vs =
-                        VaultState::open(Vault::open(path.clone()), watcher, self.notices.clone());
-                    vs.view_mode = self.settings.view_mode;
-                    vs.show_graph = self.settings.show_graph;
-                    vs.tree_w = self.settings.tree_w;
-                    self.vault = Some(vs);
-                    self.settings.last_vault = Some(path);
-                    self.settings_dirty = true;
-                }
-                Err(e) => self
-                    .notices
-                    .error(format!("Не удалось открыть vault {}: {e}", path.display())),
+        }
+        ui::folder_picker::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn open_vault(&mut self, path: PathBuf) {
+        // Перед сменой vault дописываем несохранённую заметку старого vault.
+        // Если сохранить не удалось ни в файл, ни копией — остаёмся,
+        // иначе правки пропадут вместе со старым VaultState.
+        if let Some(vs) = &mut self.vault {
+            if vs.flush_or_copy().is_err() {
+                self.notices
+                    .error("Vault не сменён: не удалось сохранить открытую заметку".to_string());
+                return;
             }
+        }
+        match VaultWatcher::new(&path, repaint_on_change(&self.ctx)) {
+            Ok(watcher) => {
+                let mut vs =
+                    VaultState::open(Vault::open(path.clone()), watcher, self.notices.clone());
+                vs.view_mode = self.settings.view_mode;
+                vs.show_graph = self.settings.show_graph;
+                vs.tree_w = self.settings.tree_w;
+                self.vault = Some(vs);
+                self.settings.last_vault = Some(path);
+                self.settings_dirty = true;
+            }
+            Err(e) => self
+                .notices
+                .error(format!("Не удалось открыть vault {}: {e}", path.display())),
         }
     }
 
@@ -205,6 +225,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
+        // Пока открыта модалка выбора папки, глобальные шорткаты не работают:
+        // Esc должен закрывать её, а не сбрасывать поиск.
+        let picker_open = self.picker.is_some();
 
         // Глобальные шорткаты (читаем до того, как виджеты успеют поглотить события).
         let ctrl_o = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
@@ -219,20 +242,22 @@ impl eframe::App for App {
         if let Some(vs) = self.vault.as_mut() {
             vs.poll_watcher(now, ui.ctx());
             vs.maybe_autosave(now, ui.ctx());
-            if ctrl_s {
-                // Ошибка уже показана уведомлением; правки остаются несохранёнными.
-                let _ = vs.flush();
-            }
-            if ctrl_o {
-                vs.quick_open = Some(state::QuickOpen {
-                    query: String::new(),
-                    selected: 0,
-                });
-            }
-            if vs.quick_open.is_none()
-                && state::should_clear_search(esc, search_focused, vs.search_query.is_empty())
-            {
-                vs.search_query.clear();
+            if !picker_open {
+                if ctrl_s {
+                    // Ошибка уже показана уведомлением; правки остаются несохранёнными.
+                    let _ = vs.flush();
+                }
+                if ctrl_o {
+                    vs.quick_open = Some(state::QuickOpen {
+                        query: String::new(),
+                        selected: 0,
+                    });
+                }
+                if vs.quick_open.is_none()
+                    && state::should_clear_search(esc, search_focused, vs.search_query.is_empty())
+                {
+                    vs.search_query.clear();
+                }
             }
         }
 
@@ -252,7 +277,7 @@ impl eframe::App for App {
                 ui.heading("mdwriter");
                 ui.separator();
                 if ui.button("Open vault…").clicked() {
-                    self.open_vault();
+                    self.start_vault_picker();
                 }
                 let mut open_today = false;
                 let mut export_html = false;
@@ -297,7 +322,7 @@ impl eframe::App for App {
                     self.open_today();
                 }
                 if export_html {
-                    self.export_html();
+                    self.start_export_picker();
                 }
             });
 
@@ -378,7 +403,7 @@ impl eframe::App for App {
                 main_ui.shrink_clip_rect(main_rect);
                 main_ui.centered_and_justified(|ui| {
                     if ui.button("Open vault…").clicked() {
-                        self.open_vault();
+                        self.start_vault_picker();
                     }
                 });
             }
@@ -598,6 +623,24 @@ impl eframe::App for App {
                     },
                 );
             }
+        }
+
+        // Модалка выбора папки — последней, чтобы быть поверх остального UI.
+        let picker_action = match self.picker.as_mut() {
+            Some(picker) => ui::folder_picker::show(ui, picker),
+            None => None,
+        };
+        match picker_action {
+            Some(ui::folder_picker::Action::Opened(path)) => {
+                self.picker = None;
+                self.open_vault(path);
+            }
+            Some(ui::folder_picker::Action::Saved(path)) => {
+                self.picker = None;
+                self.export_html_to(path);
+            }
+            Some(ui::folder_picker::Action::Cancelled) => self.picker = None,
+            None => {}
         }
 
         self.sync_settings(ui.ctx());

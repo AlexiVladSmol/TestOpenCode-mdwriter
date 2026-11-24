@@ -51,34 +51,41 @@ pub(crate) fn render_html(title: &str, md: &str) -> String {
 }
 
 impl App {
-    /// Экспорт открытой заметки в HTML.
-    ///
-    /// Берётся текст из буфера редактора, а не с диска: последние правки
+    /// Имя файла по умолчанию и текст открытой заметки (для экспорта).
+    /// Текст берётся из буфера редактора, а не с диска: последние правки
     /// (ещё не автосохранённые) тоже попадают в файл.
-    pub(crate) fn export_html(&mut self) {
-        let (default_name, text) = match &self.vault {
-            Some(vs) => match &vs.open {
-                Some(rel) => (
-                    format!(
-                        "{}.html",
-                        rel.file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "note".to_string())
-                    ),
-                    vs.editor_text.clone(),
-                ),
-                None => return,
-            },
-            None => return,
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .save_file()
-        else {
+    fn export_target(&self) -> Option<(String, String)> {
+        let vs = self.vault.as_ref()?;
+        let rel = vs.open.clone()?;
+        let stem = rel
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "note".to_string());
+        Some((stem, vs.editor_text.clone()))
+    }
+
+    /// Открывает встроенную модалку выбора папки и имени файла.
+    pub(crate) fn start_export_picker(&mut self) {
+        let Some((stem, _)) = self.export_target() else {
             return;
         };
+        let start = self.start_dir();
+        self.picker = Some(crate::ui::folder_picker::Picker::export_html(
+            start,
+            format!("{stem}.html"),
+        ));
+    }
 
-        let html = render_html(&default_name, &text);
+    /// Пишет HTML открытой заметки по выбранному пути.
+    pub(crate) fn export_html_to(&mut self, path: std::path::PathBuf) {
+        let Some((stem, text)) = self.export_target() else {
+            return;
+        };
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{stem}.html"));
+        let html = render_html(&title, &text);
         match std::fs::write(&path, html) {
             Ok(()) => self
                 .notices
