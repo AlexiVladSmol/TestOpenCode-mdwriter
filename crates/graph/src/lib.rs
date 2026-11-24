@@ -17,6 +17,21 @@ type GraphTy = PGraph<String, (), Undirected>;
 /// 300+ заметок не затихал бы никогда — даже за 3000 кадров (замер Claude).
 const SETTLE_ENERGY_PER_NODE: f32 = 0.02;
 
+/// Начальная «температура» — максимум, на который узел может сдвинуться за
+/// шаг. Первая раскладка начинается с большой температуры, дальше она падает
+/// (классическое «остывание» Fruchterman–Reingold, C4a).
+const INITIAL_TEMPERATURE: f32 = 40.0;
+
+/// Температура после `update()`, когда позиции уже известны: граф уже разложен,
+/// нужно лишь слегка подвинуть узлы, а не раскладывать заново.
+const WARM_START_TEMPERATURE: f32 = 6.0;
+
+/// Во сколько раз температура падает за шаг.
+const COOLING: f32 = 0.985;
+
+/// Ниже этой температуры шаг не уменьшается: меньше — уже незаметно.
+const MIN_TEMPERATURE: f32 = 0.05;
+
 /// Страховка: максимум шагов симуляции на одну раскладку.
 ///
 /// На больших графах энергия не сходится к нулю вообще: силы отталкивания
@@ -39,6 +54,8 @@ pub struct GraphView {
     /// Сколько шагов сделано с последнего `update`/`wake` (страховка от
     /// бесконечной анимации).
     steps_done: u32,
+    /// Текущая «температура»: максимум смещения узла за шаг.
+    temperature: f32,
 }
 
 impl Default for GraphView {
@@ -51,6 +68,7 @@ impl Default for GraphView {
             vel: Vec::new(),
             settled: false,
             steps_done: 0,
+            temperature: INITIAL_TEMPERATURE,
         }
     }
 }
@@ -70,12 +88,21 @@ impl GraphView {
         self.settled = false;
         self.steps_done = 0;
 
+        let mut kept = false;
         for (i, p) in self.paths.iter().enumerate() {
             if let Some(v) = old.get(p) {
                 self.pos[i] = *v;
                 self.vel[i] = Vec2::ZERO;
+                kept = true;
             }
         }
+        // Позиции сохранились — стартуем с низкой температуры, иначе граф
+        // «взрывался» бы при каждом сохранении заметки (C4a).
+        self.temperature = if kept {
+            WARM_START_TEMPERATURE
+        } else {
+            INITIAL_TEMPERATURE
+        };
     }
 
     fn rebuild(&mut self, index: &Index) {
@@ -158,7 +185,10 @@ impl GraphView {
             *f -= *p * 0.03;
         }
 
-        // Интегрирование с демпфированием.
+        // Интегрирование с демпфированием и ограничением смещения: узел не
+        // может сдвинуться больше текущей температуры за шаг — это и заставляет
+        // раскладку «остывать», а не дрожать вокруг равновесия (C4a).
+        let temperature = self.temperature;
         for (p, (v, f)) in self
             .pos
             .iter_mut()
@@ -168,8 +198,13 @@ impl GraphView {
             if v.length() < 0.001 {
                 *v = Vec2::ZERO;
             }
+            let speed = v.length();
+            if speed > temperature {
+                *v *= temperature / speed;
+            }
             *p += *v;
         }
+        self.temperature = (self.temperature * COOLING).max(MIN_TEMPERATURE);
 
         self.vel.iter().map(|v| v.length_sq()).sum()
     }
@@ -203,6 +238,12 @@ impl GraphView {
     pub fn wake(&mut self) {
         self.settled = false;
         self.steps_done = 0;
+        self.temperature = WARM_START_TEMPERATURE;
+    }
+
+    /// Текущая температура раскладки (для тестов и отладки).
+    pub fn temperature(&self) -> f32 {
+        self.temperature
     }
 
     /// Сколько шагов симуляции сделано с последней сборки/пробуждения.
@@ -299,12 +340,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Граф из 300+ заметок (та же плотность связей, что в реальном vault)
-    /// должен успокаиваться за ограниченное число кадров, а не крутиться вечно.
-    #[test]
-    fn large_graph_settles_within_bounded_frames() {
-        let (vault, dir) = temp_vault("big");
-        let n = 320;
+    /// Граф из `n` заметок с той же плотностью связей, что в реальном vault.
+    fn graph_with_notes(tag: &str, n: usize) -> (GraphView, PathBuf) {
+        let (vault, dir) = temp_vault(tag);
         for i in 0..n {
             let links: String = (1..=3)
                 .map(|k| format!("[[note{}]]", (i + k * 7) % n))
@@ -321,7 +359,14 @@ mod tests {
         let mut graph = GraphView::default();
         graph.update(&index);
         assert_eq!(graph.node_count(), n);
+        (graph, dir)
+    }
 
+    /// Граф из 300+ заметок (та же плотность связей, что в реальном vault)
+    /// должен успокаиваться за ограниченное число кадров, а не крутиться вечно.
+    #[test]
+    fn large_graph_settles_within_bounded_frames() {
+        let (mut graph, dir) = graph_with_notes("big", 320);
         let frames = count_frames_until_settled(&mut graph);
         assert!(
             graph.settled(),
@@ -331,6 +376,81 @@ mod tests {
         assert!(
             frames <= (MAX_ANIMATION_STEPS as usize / 3) + 1,
             "кадров больше бюджета: {frames}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// C4a: раскладка затихает **по энергии**, а не по пределу шагов, на
+    /// графах разного размера.
+    #[test]
+    fn graphs_settle_by_energy_not_by_step_limit() {
+        for n in [100, 300] {
+            let (mut graph, dir) = graph_with_notes(&format!("energy{n}"), n);
+            count_frames_until_settled(&mut graph);
+            assert!(graph.settled(), "{n} заметок не успокоились");
+            assert!(
+                graph.steps_done() < MAX_ANIMATION_STEPS,
+                "{n} заметок: {} шагов — это предел, а не энергия",
+                graph.steps_done()
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    #[ignore = "1000 заметок: медленно в debug, запускать вручную"]
+    fn thousand_notes_settle_by_energy() {
+        let (mut graph, dir) = graph_with_notes("energy1000", 1000);
+        count_frames_until_settled(&mut graph);
+        assert!(graph.settled());
+        assert!(
+            graph.steps_done() < MAX_ANIMATION_STEPS,
+            "1000 заметок: {} шагов — это предел, а не энергия",
+            graph.steps_done()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// C4a: после `update()` с сохранёнными позициями раскладка стартует
+    /// «тёплой» и затихает заметно быстрее первой.
+    #[test]
+    fn update_with_kept_positions_starts_warm() {
+        let (vault, dir) = temp_vault("warm");
+        let n = 120;
+        for i in 0..n {
+            let links: String = (1..=3)
+                .map(|k| format!("[[note{}]]", (i + k * 7) % n))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vault
+                .write(
+                    Path::new(&format!("note{i}.md")),
+                    &format!("# {i}\n{links}"),
+                )
+                .unwrap();
+        }
+        let index = Index::build(&vault).unwrap();
+
+        let mut graph = GraphView::default();
+        graph.update(&index);
+        // Первая раскладка — с полной температурой.
+        assert_eq!(graph.temperature(), INITIAL_TEMPERATURE);
+        count_frames_until_settled(&mut graph);
+        let cold_steps = graph.steps_done();
+
+        // Одна заметка изменилась: позиции сохраняются, старт тёплый.
+        vault
+            .write(Path::new("note0.md"), "# 0\n[[note7]] [[note14]]")
+            .unwrap();
+        let index = Index::build(&vault).unwrap();
+        graph.update(&index);
+        assert_eq!(graph.temperature(), WARM_START_TEMPERATURE);
+        count_frames_until_settled(&mut graph);
+        let warm_steps = graph.steps_done();
+
+        assert!(
+            warm_steps < cold_steps,
+            "тёплый старт дал {warm_steps} шагов против {cold_steps} у первой раскладки"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
