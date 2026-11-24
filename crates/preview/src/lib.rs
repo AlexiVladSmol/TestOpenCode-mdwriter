@@ -16,9 +16,9 @@ use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Parser,
 pub enum Action {
     /// Клик по wikilink с целью `target` (без расширения).
     OpenWiki(String),
-    /// Клик по чекбоксу задачи. `line_in_body` — индекс строки в теле документа
-    /// (без учёта frontmatter).
-    ToggleTask { line_in_body: usize },
+    /// Клик по чекбоксу задачи. `offset` — байтовое смещение `[` маркера
+    /// (`[ ]`/`[x]`) во всём тексте документа, включая frontmatter.
+    ToggleTask { offset: usize },
 }
 
 /// Рисует markdown-текст в `ui`. Возвращает действия (например, клики по ссылкам).
@@ -33,14 +33,14 @@ pub fn markdown(ui: &mut Ui, text: &str) -> Vec<Action> {
         render_frontmatter(ui, fm);
     }
 
+    let task_offsets = document_task_offsets(text);
     let body = wiki_to_md(body);
-    let task_lines = collect_task_lines(&body);
     let mut task_counter = 0usize;
     let mut block_counter = 0usize;
     render_body(
         ui,
         &body,
-        &task_lines,
+        &task_offsets,
         &mut task_counter,
         &mut block_counter,
         &mut actions,
@@ -54,39 +54,35 @@ fn wiki_to_md(text: &str) -> String {
     markdown::wikilinks_to_md(text, |target| format!("wiki:{target}"))
 }
 
-/// Строки-задачи (`- [ ]`, `* [x]`, `1. [ ]` и т.п.) вне огороженных блоков.
-/// Индексы строк в тексте (в том виде, в котором он отдан парсеру).
-fn collect_task_lines(body: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut in_fence = false;
-    for (i, raw) in body.lines().enumerate() {
-        let trimmed = raw.trim_start();
-        if markdown::is_fence_line(raw) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        let b = trimmed.as_bytes();
-        let unordered = b.len() >= 5
-            && (b[0] == b'-' || b[0] == b'*' || b[0] == b'+')
-            && b[1] == b' '
-            && b[2] == b'['
-            && (b[3] == b' ' || b[3] == b'x' || b[3] == b'X')
-            && b[4] == b']';
-        let ordered = b.len() >= 7
-            && b[0].is_ascii_digit()
-            && b[1] == b'.'
-            && b[2] == b' '
-            && b[3] == b'['
-            && (b[4] == b' ' || b[4] == b'x' || b[4] == b'X')
-            && b[5] == b']';
-        if unordered || ordered {
-            out.push(i);
-        }
-    }
-    out
+/// Смещения маркеров задач во **всём** тексте документа (с frontmatter) —
+/// ровно те, что предпросмотр кладёт в [`Action::ToggleTask`]: n-й
+/// отрисованный чекбокс получает n-е смещение.
+///
+/// Считаются по исходному телу (до замены wikilinks, которая сдвигает байты);
+/// замена не меняет блочную структуру, поэтому порядок маркеров совпадает.
+pub fn document_task_offsets(text: &str) -> Vec<usize> {
+    let body = markdown::split_frontmatter(text).map_or(text, |(_, body)| body);
+    let fm_len = text.len() - body.len();
+    task_marker_offsets(body)
+        .into_iter()
+        .map(|o| o + fm_len)
+        .collect()
+}
+
+/// Байтовые смещения `[` у всех маркеров задач в `body`, в порядке документа.
+///
+/// Маркеры находит сам парсер (теми же опциями, что и рендер), поэтому
+/// учитываются задачи в цитатах, в списках `10.` и `1)`, во вложенных
+/// списках, и не учитываются строки, похожие на задачи, внутри кода.
+pub fn task_marker_offsets(body: &str) -> Vec<usize> {
+    Parser::new_ext(body, markdown::cmark_options())
+        .into_offset_iter()
+        .filter_map(|(ev, range)| match ev {
+            // Диапазон события может включать окружение — ищем `[` внутри.
+            Event::TaskListMarker(_) => body[range.clone()].find('[').map(|i| range.start + i),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_frontmatter(ui: &mut Ui, fm: &markdown::Frontmatter) {
@@ -113,7 +109,7 @@ fn render_frontmatter(ui: &mut Ui, fm: &markdown::Frontmatter) {
 fn render_body(
     ui: &mut Ui,
     md: &str,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -122,7 +118,7 @@ fn render_body(
     render_blocks(
         ui,
         &mut parser.peekable(),
-        task_lines,
+        task_offsets,
         task_counter,
         block_counter,
         actions,
@@ -132,7 +128,7 @@ fn render_body(
 fn render_blocks(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -153,7 +149,7 @@ fn render_blocks(
                     ui,
                     events,
                     start,
-                    task_lines,
+                    task_offsets,
                     task_counter,
                     block_counter,
                     actions,
@@ -165,7 +161,7 @@ fn render_blocks(
                     ui,
                     events,
                     kind,
-                    task_lines,
+                    task_offsets,
                     task_counter,
                     block_counter,
                     actions,
@@ -218,7 +214,7 @@ fn render_blocks(
 fn render_block_once(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -238,7 +234,7 @@ fn render_block_once(
                 ui,
                 events,
                 start,
-                task_lines,
+                task_offsets,
                 task_counter,
                 block_counter,
                 actions,
@@ -250,7 +246,7 @@ fn render_block_once(
                 ui,
                 events,
                 kind,
-                task_lines,
+                task_offsets,
                 task_counter,
                 block_counter,
                 actions,
@@ -301,7 +297,7 @@ fn render_list(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
     start: Option<u64>,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -317,7 +313,7 @@ fn render_list(
                     events,
                     ordered,
                     n,
-                    task_lines,
+                    task_offsets,
                     task_counter,
                     block_counter,
                     actions,
@@ -342,7 +338,7 @@ fn render_item(
     events: &mut Peekable<Parser<'_>>,
     ordered: bool,
     index: u64,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -365,11 +361,11 @@ fn render_item(
             Some(checked) => {
                 ui.add_space(4.0);
                 let mut c = checked;
-                let line_in_body = task_lines.get(*task_counter).copied();
+                let offset = task_offsets.get(*task_counter).copied();
                 *task_counter += 1;
                 if ui.checkbox(&mut c, "").clicked() {
-                    if let Some(line_in_body) = line_in_body {
-                        actions.push(Action::ToggleTask { line_in_body });
+                    if let Some(offset) = offset {
+                        actions.push(Action::ToggleTask { offset });
                     }
                 }
             }
@@ -394,7 +390,14 @@ fn render_item(
             }
             Some(Event::Start(_)) => {
                 ui.indent("nested", |ui| {
-                    render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
+                    render_block_once(
+                        ui,
+                        events,
+                        task_offsets,
+                        task_counter,
+                        block_counter,
+                        actions,
+                    )
                 });
             }
             Some(_) => {
@@ -409,7 +412,7 @@ fn render_blockquote(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
     kind: Option<BlockQuoteKind>,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -435,7 +438,7 @@ fn render_blockquote(
                     render_quote_content(
                         ui,
                         events,
-                        task_lines,
+                        task_offsets,
                         task_counter,
                         block_counter,
                         actions,
@@ -455,7 +458,7 @@ fn render_blockquote(
                     render_quote_content(
                         ui,
                         events,
-                        task_lines,
+                        task_offsets,
                         task_counter,
                         block_counter,
                         actions,
@@ -468,7 +471,7 @@ fn render_blockquote(
 fn render_quote_content(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
-    task_lines: &[usize],
+    task_offsets: &[usize],
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
@@ -479,9 +482,14 @@ fn render_quote_content(
                 events.next();
                 break;
             }
-            Some(Event::Start(_)) => {
-                render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
-            }
+            Some(Event::Start(_)) => render_block_once(
+                ui,
+                events,
+                task_offsets,
+                task_counter,
+                block_counter,
+                actions,
+            ),
             Some(_) => {
                 events.next();
             }
@@ -1012,12 +1020,62 @@ mod tests {
         assert_eq!(markers, vec![false, true, false]);
     }
 
+    // ------------------- B2: маркеры задач по смещению -------------------
+
+    /// Текст маркера по каждому найденному смещению.
+    fn markers(body: &str) -> Vec<&str> {
+        task_marker_offsets(body)
+            .into_iter()
+            .map(|o| &body[o..o + 3])
+            .collect()
+    }
+
     #[test]
-    fn collect_task_lines_basic() {
+    fn b2_offsets_point_at_markers() {
         let body =
             "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
-        let lines = collect_task_lines(body);
-        assert_eq!(lines, vec![0, 1, 2]);
+        assert_eq!(markers(body), vec!["[ ]", "[x]", "[ ]"]);
+        assert_eq!(task_marker_offsets(body)[0], 2);
+    }
+
+    #[test]
+    fn b2_tasks_in_blockquote_are_counted() {
+        // Старый построчный поиск их не видел, а парсер рисует чекбокс —
+        // нумерация сдвигалась, и клик переключал другую задачу.
+        let body = "> - [ ] в цитате\n\n- [x] обычная\n";
+        assert_eq!(markers(body), vec!["[ ]", "[x]"]);
+        assert_eq!(task_marker_offsets(body)[1], body.find("[x]").unwrap());
+    }
+
+    #[test]
+    fn b2_multi_digit_and_paren_ordered_lists() {
+        let body = "10. [ ] десять\n1) [x] скобка\n";
+        assert_eq!(markers(body), vec!["[ ]", "[x]"]);
+    }
+
+    #[test]
+    fn b2_indented_code_is_not_a_task() {
+        // 4 пробела после абзаца — блок кода, а не задача.
+        let body = "абзац\n\n    - [ ] в коде\n\n- [x] задача\n";
+        assert_eq!(markers(body), vec!["[x]"]);
+    }
+
+    #[test]
+    fn b2_marker_not_text_with_brackets() {
+        // В строке есть ещё «[ ]» в тексте — смещение указывает на маркер.
+        let body = "- [x] купить [ ] что-то\n";
+        assert_eq!(task_marker_offsets(body), vec![2]);
+    }
+
+    #[test]
+    fn b2_wikilink_transform_keeps_task_count() {
+        // Рендер идёт по тексту после замены wikilinks, а смещения — по
+        // исходному; число и порядок маркеров обязаны совпадать.
+        let body = "- [ ] позвонить [[Иван Петров|Ивану]]\n> - [x] см. [[a#b]]\n10. [ ] [[c]]\n";
+        let original = task_marker_offsets(body).len();
+        let transformed = task_marker_offsets(&wiki_to_md(body)).len();
+        assert_eq!(original, 3);
+        assert_eq!(transformed, original);
     }
 
     #[test]

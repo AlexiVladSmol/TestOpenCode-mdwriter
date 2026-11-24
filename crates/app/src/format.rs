@@ -66,9 +66,47 @@ pub(crate) fn fmt_quote(line: &str) -> String {
     }
 }
 
+/// Переключает маркер задачи, начинающийся с байта `offset`:
+/// `[ ]` → `[x]`, `[x]`/`[X]` → `[ ]`. Возвращает `false` и ничего не
+/// меняет, если по смещению нет маркера (например, текст изменился после
+/// отрисовки предпросмотра) — лучше пропустить клик, чем испортить текст.
+pub(crate) fn toggle_task_at(text: &mut String, offset: usize) -> bool {
+    let Some(marker) = text.get(offset..offset + 3) else {
+        return false; // вне текста или не на границе символа
+    };
+    let replacement = match marker {
+        "[ ]" => "[x]",
+        "[x]" | "[X]" => "[ ]",
+        _ => return false,
+    };
+    text.replace_range(offset..offset + 3, replacement);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn b2_toggle_task_at_marker() {
+        let mut t = String::from("- [ ] a\n- [X] b\n");
+        assert!(toggle_task_at(&mut t, 2));
+        assert_eq!(t, "- [x] a\n- [X] b\n");
+        assert!(toggle_task_at(&mut t, 10));
+        assert_eq!(t, "- [x] a\n- [ ] b\n");
+        assert!(toggle_task_at(&mut t, 2));
+        assert_eq!(t, "- [ ] a\n- [ ] b\n");
+    }
+
+    #[test]
+    fn b2_toggle_task_at_rejects_wrong_offset() {
+        let mut t = String::from("- [ ] задача");
+        let before = t.clone();
+        assert!(!toggle_task_at(&mut t, 0)); // не маркер
+        assert!(!toggle_task_at(&mut t, 7)); // внутри многобайтового символа
+        assert!(!toggle_task_at(&mut t, 100)); // за концом текста
+        assert_eq!(t, before);
+    }
 
     #[test]
     fn lines_range_does_not_panic_on_utf8() {

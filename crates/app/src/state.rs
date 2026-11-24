@@ -10,7 +10,7 @@ use graph::GraphView;
 use index::Index;
 use vault::{Vault, VaultError, VaultWatcher};
 
-use crate::format::lines_range;
+use crate::format::{lines_range, toggle_task_at};
 use crate::notice::Notices;
 use crate::sync::{self, Reconcile};
 use crate::tree;
@@ -521,44 +521,15 @@ impl VaultState {
         }
     }
 
-    /// Переключает `[ ]` ↔ `[x]` в исходнике по индексу строки тела документа.
-    fn toggle_task(&mut self, line_in_body: usize) {
-        // Смещение строки из-за frontmatter.
-        let fm_lines = match markdown::split_frontmatter(&self.editor_text) {
-            Some((_, body)) => {
-                let consumed = self.editor_text.len() - body.len();
-                self.editor_text[..consumed]
-                    .bytes()
-                    .filter(|&b| b == b'\n')
-                    .count()
-            }
-            None => 0,
-        };
-        let line_idx = fm_lines + line_in_body;
-
-        // Начало и конец целевой строки.
-        let mut start = 0;
-        for _ in 0..line_idx {
-            let Some(rel) = self.editor_text[start..].find('\n') else {
-                return;
-            };
-            start += rel + 1;
-        }
-        let line_end = self.editor_text[start..]
-            .find('\n')
-            .map(|r| start + r)
-            .unwrap_or(self.editor_text.len());
-
-        let line = &self.editor_text[start..line_end];
-        for pat in ["[ ]", "[x]", "[X]"] {
-            if let Some(pos) = line.find(pat) {
-                let abs = start + pos;
-                let replacement = if pat == "[ ]" { "[x]" } else { "[ ]" };
-                self.editor_text.replace_range(abs..abs + 3, replacement);
-                self.dirty = true;
-                self.last_edit = None; // автосохранение сработает сразу
-                return;
-            }
+    /// Переключает `[ ]` ↔ `[x]` у маркера задачи по байтовому смещению
+    /// во всём тексте (его даёт предпросмотр).
+    fn toggle_task(&mut self, offset: usize) {
+        if toggle_task_at(&mut self.editor_text, offset) {
+            self.dirty = true;
+            self.last_edit = None; // автосохранение сработает сразу
+        } else {
+            self.notices
+                .info("Задача не переключена: текст изменился, повторите клик");
         }
     }
 
@@ -844,8 +815,8 @@ impl VaultState {
                         self.load(rel);
                     }
                 }
-                preview::Action::ToggleTask { line_in_body } => {
-                    self.toggle_task(line_in_body);
+                preview::Action::ToggleTask { offset } => {
+                    self.toggle_task(offset);
                 }
             }
         }
@@ -1103,5 +1074,49 @@ mod tests {
         vs.poll_watcher(RESCAN_DELAY, &ctx);
         assert_eq!(vs.pending_rescan_at, None);
         assert_eq!(vs.editor_text, "извне");
+    }
+
+    // ------------------- B2: переключение задач -------------------
+
+    /// Документ, на котором старый построчный поиск переключал не ту задачу:
+    /// frontmatter, задача в цитате (её не видел счётчик строк) и `[ ]` в
+    /// тексте задачи.
+    const B2_DOC: &str =
+        "---\ntitle: Т\n---\n> - [ ] в цитате\n\n- [x] купить [ ] хлеб\n10. [ ] десятая\n";
+
+    #[test]
+    fn b2_click_toggles_exactly_that_task() {
+        let (mut vs, _dir) = open_a();
+        vs.editor_text = B2_DOC.to_string();
+        let offsets = preview::document_task_offsets(&vs.editor_text);
+        assert_eq!(offsets.len(), 3);
+
+        // Клик по второму чекбоксу («купить»): меняется только её маркер.
+        vs.toggle_task(offsets[1]);
+        assert_eq!(
+            vs.editor_text,
+            "---\ntitle: Т\n---\n> - [ ] в цитате\n\n- [ ] купить [ ] хлеб\n10. [ ] десятая\n"
+        );
+        assert!(vs.dirty);
+
+        // Третий («десятая», список с номером 10).
+        vs.toggle_task(offsets[2]);
+        assert!(vs.editor_text.ends_with("10. [x] десятая\n"));
+        // Первый — в цитате.
+        vs.toggle_task(offsets[0]);
+        assert!(vs.editor_text.contains("> - [x] в цитате"));
+    }
+
+    #[test]
+    fn b2_stale_offset_changes_nothing() {
+        let (mut vs, _dir) = open_a();
+        vs.editor_text = B2_DOC.to_string();
+        let offsets = preview::document_task_offsets(&vs.editor_text);
+        // Пользователь успел дописать текст в начало — смещение устарело.
+        vs.editor_text.insert(0, 'x');
+        vs.dirty = false;
+        vs.toggle_task(offsets[1]);
+        assert_eq!(vs.editor_text, format!("x{B2_DOC}"));
+        assert!(!vs.dirty);
     }
 }
