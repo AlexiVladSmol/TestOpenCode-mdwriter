@@ -70,6 +70,9 @@ pub struct NoteMeta {
 pub struct Index {
     notes: HashMap<PathBuf, NoteMeta>,
     contents: HashMap<PathBuf, String>,
+    /// Нижний регистр текста и заголовка для поиска: строится один раз при
+    /// добавлении заметки, а не на каждый запрос (C2a).
+    lower_texts: HashMap<PathBuf, LowerText>,
 
     // --- Производные данные: пересчитываются в `rebuild_derived`. ---
     /// Нормализованный путь (`sub/note.md`: нижний регистр, `/`) → путь заметки.
@@ -181,6 +184,7 @@ impl Index {
             NoteChange::Remove(rel) => {
                 self.file_warnings.remove(&rel);
                 self.contents.remove(&rel);
+                self.lower_texts.remove(&rel);
                 self.notes.remove(&rel).is_some()
             }
             NoteChange::Unreadable { rel, error } => {
@@ -213,6 +217,9 @@ impl Index {
             .map(|w| w.target)
             .collect();
 
+        // Поисковые копии строим здесь же: `search` больше ничего не
+        // пересчитывает (C2a).
+        let lowered = LowerText::new(&text, &title);
         self.notes.insert(
             rel.clone(),
             NoteMeta {
@@ -221,6 +228,7 @@ impl Index {
                 links_out,
             },
         );
+        self.lower_texts.insert(rel.clone(), lowered);
         self.contents.insert(rel, text);
     }
 
@@ -387,13 +395,12 @@ impl Index {
         // (совпадение в заголовке, путь, сниппет)
         let mut hits: Vec<(bool, PathBuf, String)> = Vec::new();
         for (rel, text) in &self.contents {
-            let title_hit = self
-                .notes
-                .get(rel)
-                .map(|m| find_ci(&m.title, &q).is_some())
-                .unwrap_or(false);
-            // Позиция — из `find_ci`, то есть уже в исходном тексте (C2).
-            let body = find_ci(text, &q);
+            let Some(lowered) = self.lower_texts.get(rel) else {
+                continue;
+            };
+            let title_hit = lowered.title_lower.contains(q.as_str());
+            // Позиция уже в исходном тексте: смещения переводит `LowerText`.
+            let body = lowered.find(text, &q);
             let snippet_text = match body {
                 Some(range) => snippet(text, range.start, range.len()),
                 None if title_hit => snippet(text, 0, 0),
@@ -438,24 +445,69 @@ fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
 }
 
-/// Регистронезависимый поиск `needle_lower` (уже в нижнем регистре) в `hay`.
+/// Готовая к поиску копия текста: нижний регистр и, если смена регистра
+/// изменила длину, карта смещений обратно в исходную строку.
 ///
-/// Возвращает диапазон **в исходной строке**. Позицию из `to_lowercase()`
-/// брать нельзя: смена регистра меняет длину (`İ` → `i̇`, знак Кельвина `K` →
-/// `k`), и тогда сниппет съезжает (C2).
-fn find_ci(hay: &str, needle_lower: &str) -> Option<std::ops::Range<usize>> {
-    if needle_lower.is_empty() {
-        return None;
+/// Раньше (`C2`) эта копия строилась на каждый запрос для каждой заметки:
+/// 8 байт карты на байт текста и полный `to_lowercase()` на каждое нажатие
+/// клавиши. Теперь она живёт в индексе и обновляется вместе с заметкой (C2a).
+#[derive(Debug, Default)]
+struct LowerText {
+    lower: String,
+    title_lower: String,
+    /// Карта «байт в нижнем регистре → байт в исходной строке». `None`, когда
+    /// ни один символ не меняет длину при смене регистра: тогда смещения
+    /// совпадают и карта не нужна.
+    map: Option<Vec<usize>>,
+}
+
+impl LowerText {
+    fn new(text: &str, title: &str) -> Self {
+        // Сравнивать общие длины нельзя: `İ` удлиняется (2 → 3 байта), знак
+        // Кельвина укорачивается (3 → 1), и вместе они дают ту же длину —
+        // карта тогда не строится, а смещения уже не те.
+        let needs_map = text
+            .chars()
+            .any(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() != c.len_utf8());
+        let (lower, map) = if needs_map {
+            let (lower, map) = lower_with_map(text);
+            (lower, Some(map))
+        } else {
+            (text.to_lowercase(), None)
+        };
+        Self {
+            lower,
+            title_lower: title.to_lowercase(),
+            map,
+        }
     }
-    let (lower, map) = lower_with_map(hay);
-    let pos = lower.find(needle_lower)?;
-    let start = map[pos];
-    let mut end = map[pos + needle_lower.len()];
-    if end <= start {
-        // Совпадение «внутри» одного исходного символа (например, `i` в `İ`).
-        end = start + hay[start..].chars().next().map(char::len_utf8).unwrap_or(0);
+
+    /// Диапазон совпадения в **исходной** строке `text`, по которой построена
+    /// эта копия; `needle_lower` уже в нижнем регистре.
+    fn find(&self, text: &str, needle_lower: &str) -> Option<std::ops::Range<usize>> {
+        if needle_lower.is_empty() {
+            return None;
+        }
+        let pos = self.lower.find(needle_lower)?;
+        match &self.map {
+            None => Some(pos..pos + needle_lower.len()),
+            Some(map) => {
+                let start = map[pos];
+                let mut end = map[pos + needle_lower.len()];
+                if end <= start {
+                    // Совпадение «внутри» одного исходного символа
+                    // (например, `i` в `İ`).
+                    end = start
+                        + text[start..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(0);
+                }
+                Some(start..end)
+            }
+        }
     }
-    Some(start..end)
 }
 
 /// Нижний регистр строки и карта «смещение в нижнем регистре → смещение в
@@ -1059,26 +1111,63 @@ mod tests {
 
     // ------------------------------- C2: поиск -------------------------------
 
+    /// C2a: копия для поиска хранится в индексе, карта смещений — только
+    /// когда смена регистра изменила длину.
     #[test]
-    fn find_ci_returns_range_in_the_original_string() {
+    fn lower_text_builds_the_map_only_when_needed() {
+        let plain = LowerText::new("Ёлка стоит", "Ёлка");
+        assert!(plain.map.is_none(), "длина не изменилась — карта не нужна");
+        assert_eq!(plain.title_lower, "ёлка");
+
+        let kelvin = "\u{212A}ельвин";
+        let changed = LowerText::new(kelvin, "");
+        assert!(changed.map.is_some(), "знак Кельвина меняет длину");
+    }
+
+    /// Регрессия ревью: длина всего текста может совпасть случайно —
+    /// `İİ` удлиняется на 2 байта, знак Кельвина укорачивается на 2. Карта
+    /// всё равно нужна, иначе сниппет съезжает (6..9 вместо 4..7).
+    #[test]
+    fn lower_text_builds_the_map_when_only_the_total_length_matches() {
+        let text = "İİabc\u{212A}";
+        assert_eq!(
+            text.len(),
+            text.to_lowercase().len(),
+            "предпосылка теста: общие длины совпадают"
+        );
+
+        let lowered = LowerText::new(text, "");
+        assert!(
+            lowered.map.is_some(),
+            "общая длина совпала случайно — карта всё равно нужна"
+        );
+        assert_eq!(lowered.find(text, "abc"), Some(4..7));
+    }
+
+    #[test]
+    fn lower_text_finds_range_in_the_original_string() {
+        let find = |text: &str, needle: &str| LowerText::new(text, "").find(text, needle);
+
         // Кириллица: нижний регистр не меняет длину.
-        assert_eq!(find_ci("Ёлка стоит", "ёлка"), Some(0..8));
+        assert_eq!(find("Ёлка стоит", "ёлка"), Some(0..8));
         // Знак Кельвина U+212A (не латинская K): 3 байта → «k» 1 байт,
         // длина меняется, поэтому диапазон должен вернуться в исходной строке.
         let kelvin = "\u{212A}ельвин";
-        assert_eq!(find_ci(kelvin, "kельвин"), Some(0..kelvin.len()));
+        assert_eq!(find(kelvin, "kельвин"), Some(0..kelvin.len()));
         // İ U+0130: 2 байта → «i» + комбинирующая точка, длина меняется.
         // Позиция из to_lowercase() (4) разрезала бы «BC» пополам.
-        assert_eq!(find_ci("AİBC", "bc"), Some(3..5));
-        assert_eq!(find_ci("без совпадений", "zzz"), None);
-        assert_eq!(find_ci("что-то", ""), None);
+        assert_eq!(find("AİBC", "bc"), Some(3..5));
+        assert_eq!(find("без совпадений", "zzz"), None);
+        assert_eq!(find("что-то", ""), None);
     }
 
     /// Сниппет вокруг совпадения не съезжает, если текст содержит `İ`.
     #[test]
     fn snippet_is_correct_after_a_case_changing_character() {
         let text = "AİBC искомое слово";
-        let range = find_ci(text, "искомое").expect("совпадение есть");
+        let range = LowerText::new(text, "")
+            .find(text, "искомое")
+            .expect("совпадение есть");
         let s = snippet(text, range.start, range.len());
         assert!(s.contains("искомое"), "{s}");
     }
