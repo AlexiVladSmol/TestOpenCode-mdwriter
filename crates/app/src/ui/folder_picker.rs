@@ -334,6 +334,7 @@ fn with_html_extension(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
     use super::*;
@@ -343,11 +344,18 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            // Время + счётчик: на Windows часы тикают ~15 мс, и параллельные
+            // тесты успевали получить одинаковые имена папок.
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
             let nanos = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("mdwriter-picker-{tag}-{nanos}"));
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mdwriter-picker-{tag}-{nanos}-{}-{n}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&path).expect("временная папка");
             Self(path)
         }

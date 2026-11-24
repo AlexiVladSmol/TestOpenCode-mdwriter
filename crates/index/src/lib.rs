@@ -297,11 +297,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_vault() -> (Vault, PathBuf) {
+        // Время + счётчик: на Windows часы тикают ~15 мс, и параллельные тесты
+        // получали одинаковые имена временных папок.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mdwriter-index-test-{unique}"));
+        let dir = std::env::temp_dir().join(format!(
+            "mdwriter-index-test-{unique}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         (Vault::open(dir.clone()), dir)
     }

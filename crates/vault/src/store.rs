@@ -230,16 +230,9 @@ fn temp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(prefix: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("{prefix}{unique}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_support::unique_temp_dir(prefix)
     }
 
     fn temp_vault() -> (Vault, PathBuf) {

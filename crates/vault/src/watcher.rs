@@ -208,12 +208,7 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!("mdwriter-watch-{tag}-{unique}"));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::unique_temp_dir(&format!("mdwriter-watch-{tag}-"));
             let dir = dir.canonicalize().unwrap_or(dir);
             Self(dir)
         }
@@ -294,11 +289,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mdwriter-watch-{unique}"));
+        let dir = crate::test_support::unique_temp_dir("mdwriter-watch-");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         // Канонический путь: так его возвращает и notify (на macOS /var → /private/var).
         let dir = dir.canonicalize().unwrap_or(dir);
