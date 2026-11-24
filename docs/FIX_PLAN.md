@@ -120,7 +120,7 @@
 | E1 | P1 | CI: fmt + clippy + test на Windows и Linux | — | DeepSeek | 0 | [x] |
 | E2 | P2 | Указать `rust-version` | — | DeepSeek | 4 | [x] |
 | E3 | P3 | Почистить `.gitignore` | — | DeepSeek | 0 | [x] |
-| E4 | P2 | Актуализировать `PLAN.md` и README | после фаз A–C | DeepSeek | 5 | [ ] |
+| E4 | P2 | Актуализировать `PLAN.md` и README | после фаз A–C | DeepSeek | 5 | [x] |
 | G7a | P0 | Слежение за папками, созданными после открытия vault (регрессия G7) | — | Claude | 4 | [x] |
 | G6a | P1 | Экспорт HTML: не перезаписывать молча, только `.html` (недоделка G6) | — | DeepSeek | 4 | [x] |
 | G1a | P2 | Требование OpenGL 2.0 в заметках к релизу и README (G1) | — | DeepSeek | 4 | [x] |
