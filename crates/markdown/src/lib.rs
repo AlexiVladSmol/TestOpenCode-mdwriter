@@ -28,6 +28,29 @@ pub struct Wikilink {
     pub range: Range<usize>,
 }
 
+/// Цель wikilink, разложенная на путь и якорь: `note#Заголовок` → (`note`, `Заголовок`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTarget<'a> {
+    /// Путь заметки без якоря (может быть пустым для `[[#Заголовок]]`).
+    pub path: &'a str,
+    /// Якорь после первого `#` (заголовок или блок `^id`).
+    pub anchor: Option<&'a str>,
+}
+
+/// Делит цель wikilink по первому `#`.
+pub fn parse_link_target(raw: &str) -> LinkTarget<'_> {
+    match raw.split_once('#') {
+        Some((path, anchor)) => LinkTarget {
+            path: path.trim(),
+            anchor: Some(anchor.trim()),
+        },
+        None => LinkTarget {
+            path: raw.trim(),
+            anchor: None,
+        },
+    }
+}
+
 /// Отделяет frontmatter от тела документа.
 /// Возвращает `None`, если документ не начинается с закрытой YAML-шапки.
 ///
@@ -442,5 +465,45 @@ mod tests {
         let text = "#снаружи\n\n```\n#внутри\n```\n\n`#винлайн`\n";
         let tags = extract_tags(text);
         assert_eq!(tags, vec!["снаружи"]);
+    }
+
+    #[test]
+    fn parse_link_target_with_anchor() {
+        assert_eq!(
+            parse_link_target("note#Заголовок"),
+            LinkTarget {
+                path: "note",
+                anchor: Some("Заголовок"),
+            }
+        );
+        assert_eq!(
+            parse_link_target("note#^block"),
+            LinkTarget {
+                path: "note",
+                anchor: Some("^block"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_link_target_anchor_only() {
+        assert_eq!(
+            parse_link_target("#Заголовок"),
+            LinkTarget {
+                path: "",
+                anchor: Some("Заголовок"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_link_target_without_anchor() {
+        assert_eq!(
+            parse_link_target("note"),
+            LinkTarget {
+                path: "note",
+                anchor: None,
+            }
+        );
     }
 }

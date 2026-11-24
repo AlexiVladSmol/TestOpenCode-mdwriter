@@ -80,38 +80,56 @@ impl Index {
         v
     }
 
-    /// Разрешает `[[target]]` относительно заметки `from`.
+    /// Разрешает `[[target]]`, `[[target#якорь]]` относительно заметки `from`.
     /// Сначала ищет рядом с `from`, затем по всему vault.
-    pub fn resolve_wikilink(&self, from: &Path, target: &str) -> Option<PathBuf> {
-        let with_ext = if target.ends_with(".md") {
-            target.to_string()
+    ///
+    /// Регистр не важен, `\` и `/` считаются одним разделителем. Якорь
+    /// (`#Заголовок`, `#^block`) отбрасывается: он не часть имени файла.
+    pub fn resolve_wikilink(&self, from: &Path, raw: &str) -> Option<PathBuf> {
+        let markdown::LinkTarget { path, .. } = markdown::parse_link_target(raw);
+        // `[[#Заголовок]]` — ссылка на саму заметку.
+        if path.is_empty() {
+            return Some(from.to_path_buf());
+        }
+
+        let with_ext = if path.to_lowercase().ends_with(".md") {
+            path.to_string()
         } else {
-            format!("{target}.md")
+            format!("{path}.md")
         };
 
         // 1. Рядом с исходной заметкой.
         let from_dir = from.parent().unwrap_or(Path::new(""));
         let near = from_dir.join(&with_ext);
-        if self.notes.contains_key(&near) {
-            return Some(near);
+        let near_key = normalize_path(&near.to_string_lossy());
+        if let Some(p) = self
+            .notes
+            .keys()
+            .find(|p| normalize_path(&p.to_string_lossy()) == near_key)
+        {
+            return Some(p.clone());
         }
 
         // 2. Точное совпадение относительного пути в любом месте.
-        let as_path = Path::new(&with_ext);
-        if let Some(p) = self.notes.keys().find(|p| p.as_path() == as_path) {
+        let want = normalize_path(&with_ext);
+        if let Some(p) = self
+            .notes
+            .keys()
+            .find(|p| normalize_path(&p.to_string_lossy()) == want)
+        {
             return Some(p.clone());
         }
 
         // 3. По имени файла (первый в алфавитном порядке).
         let stem = Path::new(&with_ext)
             .file_stem()
-            .map(|s| s.to_string_lossy().to_string())?;
+            .map(|s| s.to_string_lossy().to_lowercase())?;
         let mut matches: Vec<PathBuf> = self
             .notes
             .keys()
             .filter(|p| {
                 p.file_stem()
-                    .map(|s| s.to_string_lossy() == stem)
+                    .map(|s| s.to_string_lossy().to_lowercase() == stem)
                     .unwrap_or(false)
             })
             .cloned()
@@ -167,6 +185,11 @@ fn default_title(rel: &Path) -> String {
     rel.file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| rel.display().to_string())
+}
+
+/// Ключ для сравнения путей без учёта регистра: `\` → `/`, нижний регистр.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
 }
 
 /// Сниппет вокруг совпадения (с корректными границами UTF-8).
@@ -259,6 +282,36 @@ mod tests {
         assert!(index
             .resolve_wikilink(Path::new("root.md"), "нет")
             .is_none());
+    }
+
+    #[test]
+    fn resolve_wikilink_ignores_anchor_and_case() {
+        let (vault, _dir) = test_vault();
+        vault.write(Path::new("Note.md"), "текст").unwrap();
+        vault.write(Path::new("sub/deep.md"), "текст").unwrap();
+
+        let index = Index::build(&vault).unwrap();
+
+        // Якорь отбрасывается: ищем файл `Note.md`.
+        assert_eq!(
+            index.resolve_wikilink(Path::new("sub/deep.md"), "Note#Заголовок"),
+            Some(PathBuf::from("Note.md"))
+        );
+        // Блочный якорь.
+        assert_eq!(
+            index.resolve_wikilink(Path::new("sub/deep.md"), "note#^block"),
+            Some(PathBuf::from("Note.md"))
+        );
+        // Регистр пути и расширения не важен.
+        assert_eq!(
+            index.resolve_wikilink(Path::new("sub/deep.md"), "NOTE.MD"),
+            Some(PathBuf::from("Note.md"))
+        );
+        // Только якорь — ссылка на саму заметку.
+        assert_eq!(
+            index.resolve_wikilink(Path::new("Note.md"), "#Заголовок"),
+            Some(PathBuf::from("Note.md"))
+        );
     }
 
     #[test]

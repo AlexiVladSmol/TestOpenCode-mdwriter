@@ -411,13 +411,8 @@ impl VaultState {
                 if let Some(rel) = self.index.resolve_wikilink(&from, target) {
                     return Some(rel);
                 }
-                let name = if target.ends_with(".md") {
-                    target.to_string()
-                } else {
-                    format!("{target}.md")
-                };
-                let dir = from.parent().unwrap_or(Path::new(""));
-                let rel = dir.join(name);
+                // Якорь (`#…`) в имя файла не попадает; `[[#Заголовок]]` ничего не создаёт.
+                let rel = new_note_path(&from, target)?;
                 match self.vault.create(&rel) {
                     Ok(()) => {
                         self.rescan();
@@ -836,6 +831,22 @@ impl App {
             eprintln!("export failed: {e}");
         }
     }
+}
+
+/// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),
+/// `None` — если путь пустой (`[[#Заголовок]]`), создавать нечего.
+fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
+    let markdown::LinkTarget { path, .. } = markdown::parse_link_target(raw);
+    if path.is_empty() {
+        return None;
+    }
+    let name = if path.to_lowercase().ends_with(".md") {
+        path.to_string()
+    } else {
+        format!("{path}.md")
+    };
+    let dir = from.parent().unwrap_or(Path::new(""));
+    Some(dir.join(name))
 }
 
 /// Текущая дата (UTC) в формате `ГГГГ-ММ-ДД`.
@@ -1521,6 +1532,23 @@ mod tests {
         assert!(!should_save_settings(true, true));
         assert!(!should_save_settings(false, false));
         assert!(!should_save_settings(false, true));
+    }
+
+    #[test]
+    fn new_note_path_uses_path_without_anchor() {
+        let from = Path::new("sub/cur.md");
+        assert_eq!(
+            new_note_path(from, "Note#Заголовок"),
+            Some(PathBuf::from("sub/Note.md"))
+        );
+        assert_eq!(
+            new_note_path(from, "Note#^block"),
+            Some(PathBuf::from("sub/Note.md"))
+        );
+        // Расширение не дублируется, регистр не важен.
+        assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
+        // Только якорь — создавать нечего.
+        assert_eq!(new_note_path(from, "#Только якорь"), None);
     }
 
     #[test]
