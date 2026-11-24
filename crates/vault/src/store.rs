@@ -208,7 +208,7 @@ impl Vault {
     }
 }
 
-fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+pub(crate) fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
         .to_str()

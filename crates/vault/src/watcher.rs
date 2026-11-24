@@ -15,6 +15,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 pub struct VaultWatcher {
     _watcher: RecommendedWatcher,
     rx: Receiver<Vec<PathBuf>>,
+    /// Папки, которые не удалось поставить на слежение (обычно нет прав).
+    skipped: Vec<String>,
 }
 
 impl VaultWatcher {
@@ -38,11 +40,29 @@ impl VaultWatcher {
                     }
                 }
             })?;
-        watcher.watch(root, RecursiveMode::Recursive)?;
+        // `RecursiveMode::Recursive` обрывается на первой недоступной
+        // подпапке (например, на симлинке внутрь `/tmp` из `~/.wine`), и
+        // тогда vault не открывается вовсе. Поэтому ставим слежение сами:
+        // корень обязателен, остальные папки — по одной, недоступные
+        // пропускаем и запоминаем.
+        watcher.watch(root, RecursiveMode::NonRecursive)?;
+        let mut skipped = Vec::new();
+        for dir in dirs_to_watch(root) {
+            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                skipped.push(format!("{}: {e}", dir.display()));
+            }
+        }
         Ok(Self {
             _watcher: watcher,
             rx,
+            skipped,
         })
+    }
+
+    /// Папки, за которыми слежение поставить не удалось (нет прав, кончились
+    /// `inotify` watches). Изменения в них не придут автоматически.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
     }
 
     /// Все изменённые пути с прошлого вызова (неблокирующе): без дублей,
@@ -55,6 +75,32 @@ impl VaultWatcher {
         all.dedup();
         all
     }
+}
+
+/// Все папки vault, за которыми нужно следить, кроме самого корня.
+///
+/// Скрытые папки пропускаются — ровно так же, как их пропускает обход заметок
+/// ([`crate::Vault::list_notes`]): в vault-е с домашней папкой это `.git`,
+/// `.cache`, `.wine` и прочее, где слежение бессмысленно и часто невозможно.
+/// Симлинк на папку тоже попадает в список, но внутрь него обход не идёт,
+/// поэтому циклы невозможны.
+pub(crate) fn dirs_to_watch(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !crate::store::is_hidden(e));
+    for entry in walker.flatten() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        let file_type = entry.file_type();
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir());
+        if is_dir {
+            dirs.push(entry.into_path());
+        }
+    }
+    dirs
 }
 
 /// Пути события, которые стоит передать приложению; `None` — событие
@@ -155,6 +201,90 @@ mod tests {
         assert_eq!(relevant_paths(&r, &rescan), Some(vec![r.clone()]));
         let pathless = Event::new(EventKind::Remove(RemoveKind::Any));
         assert_eq!(relevant_paths(&r, &pathless), Some(vec![r.clone()]));
+    }
+
+    /// Временная папка для тестов слежения (удаляется в `Drop`).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("mdwriter-watch-{tag}-{unique}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap_or(dir);
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn dirs_to_watch_skips_hidden_directories_and_files() {
+        let dir = TempDir::new("dirs");
+        std::fs::create_dir_all(dir.path().join("sub").join("deep")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("note.md"), "текст").unwrap();
+
+        let mut dirs: Vec<PathBuf> = dirs_to_watch(dir.path())
+            .into_iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("sub"), PathBuf::from("sub").join("deep")],
+            "корень не дублируется, скрытые папки и файлы пропущены"
+        );
+    }
+
+    #[test]
+    fn hidden_root_itself_is_watched() {
+        // Vault может лежать в скрытой папке (`~/.notes`): корень не фильтруется.
+        let dir = TempDir::new("hidden-root");
+        let hidden = dir.path().join(".notes");
+        std::fs::create_dir_all(&hidden).unwrap();
+        let watcher = VaultWatcher::new(&hidden, || {}).unwrap();
+        assert!(watcher.skipped().is_empty());
+    }
+
+    /// Регрессия G7: недоступная подпапка не должна мешать открыть vault.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reports_inaccessible_subdirectory_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("noaccess");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(dir.path().join("open")).unwrap();
+
+        // Права 000: войти в папку от своего же пользователя больше нельзя.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_err();
+
+        let watcher = VaultWatcher::new(dir.path(), || {});
+        // Вернуть права до проверок, чтобы TempDir смог удалиться.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let watcher = watcher.expect("недоступная подпапка не должна ломать открытие vault");
+        if readable {
+            assert!(
+                watcher.skipped().iter().any(|s| s.contains("locked")),
+                "ожидали запись о пропущенной папке: {:?}",
+                watcher.skipped()
+            );
+        }
     }
 
     /// Настоящая ФС: изменение заметки доходит до `take_changes`, будит

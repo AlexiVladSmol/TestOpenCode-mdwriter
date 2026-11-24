@@ -149,6 +149,10 @@ impl App {
         }
         match VaultWatcher::new(&path, repaint_on_change(&self.ctx)) {
             Ok(watcher) => {
+                // Недоступные подпапки (нет прав, кончились inotify watches) не
+                // мешают открыть vault — просто предупреждаем один раз.
+                let skipped = watcher.skipped().len();
+                let first_skipped = watcher.skipped().first().cloned();
                 let mut vs =
                     VaultState::open(Vault::open(path.clone()), watcher, self.notices.clone());
                 vs.view_mode = self.settings.view_mode;
@@ -157,6 +161,13 @@ impl App {
                 self.vault = Some(vs);
                 self.settings.last_vault = Some(path);
                 self.settings_dirty = true;
+                if skipped > 0 {
+                    let example = first_skipped.unwrap_or_default();
+                    self.notices.info(format!(
+                        "Vault открыт, но слежение недоступно для {skipped} папок (например, \
+                         {example}): изменения в них не подхватятся автоматически"
+                    ));
+                }
             }
             Err(e) => self
                 .notices
