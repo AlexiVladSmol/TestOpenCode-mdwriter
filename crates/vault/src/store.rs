@@ -40,19 +40,25 @@ impl Vault {
     }
 
     /// Рекурсивный список всех `.md` файлов (относительные пути, отсортированы).
-    /// Скрытые файлы и папки (начинающиеся с `.`) пропускаются.
+    /// Скрытые файлы и папки (начинающиеся с `.`) пропускаются, кроме самого корня:
+    /// vault может лежать в скрытой папке (`~/.notes`). Расширение сравнивается
+    /// без учёта регистра (`.md`, `.MD`).
     pub fn list_notes(&self) -> Result<Vec<PathBuf>> {
         let mut notes = Vec::new();
         let walker = walkdir::WalkDir::new(&self.root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| !is_hidden(e));
+            .filter_entry(|e| e.depth() == 0 || !is_hidden(e));
 
         for entry in walker {
             let entry = entry.map_err(std::io::Error::other)?;
             if entry.file_type().is_file() {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                let is_md = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+                if is_md {
                     notes.push(self.rel_path(path));
                 }
             }
@@ -113,13 +119,18 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_vault() -> (Vault, PathBuf) {
+    fn temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mdwriter-test-{unique}"));
+        let dir = std::env::temp_dir().join(format!("{prefix}{unique}"));
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn temp_vault() -> (Vault, PathBuf) {
+        let dir = temp_dir("mdwriter-test-");
         (Vault::open(dir.clone()), dir)
     }
 
@@ -166,5 +177,28 @@ mod tests {
         let (vault, dir) = temp_vault();
         let abs = dir.join("x").join("y.md");
         assert_eq!(vault.rel_path(&abs), PathBuf::from("x").join("y.md"));
+    }
+
+    #[test]
+    fn hidden_root_vault_is_not_empty() {
+        // Vault в скрытой папке (`~/.notes`) не должен выглядеть пустым.
+        let dir = temp_dir(".mdwriter-hidden-");
+        let vault = Vault::open(dir.clone());
+        vault.create(Path::new("note.md")).unwrap();
+        vault.create(Path::new(".secret/inner.md")).unwrap();
+
+        assert_eq!(vault.list_notes().unwrap(), vec![PathBuf::from("note.md")]);
+    }
+
+    #[test]
+    fn uppercase_md_extension_is_listed() {
+        let (vault, _dir) = temp_vault();
+        vault.create(Path::new("A.MD")).unwrap();
+        vault.create(Path::new("b.md")).unwrap();
+
+        assert_eq!(
+            vault.list_notes().unwrap(),
+            vec![PathBuf::from("A.MD"), PathBuf::from("b.md")]
+        );
     }
 }
