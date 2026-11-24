@@ -66,6 +66,23 @@ pub(crate) fn fmt_quote(line: &str) -> String {
     }
 }
 
+/// Переключает маркер задачи, начинающийся с байта `offset`:
+/// `[ ]` → `[x]`, `[x]`/`[X]` → `[ ]`. Возвращает `false` и ничего не
+/// меняет, если по смещению нет маркера (например, текст изменился после
+/// отрисовки предпросмотра) — лучше пропустить клик, чем испортить текст.
+pub(crate) fn toggle_task_at(text: &mut String, offset: usize) -> bool {
+    let Some(marker) = text.get(offset..offset + 3) else {
+        return false; // вне текста или не на границе символа
+    };
+    let replacement = match marker {
+        "[ ]" => "[x]",
+        "[x]" | "[X]" => "[ ]",
+        _ => return false,
+    };
+    text.replace_range(offset..offset + 3, replacement);
+    true
+}
+
 /// Оборачивает выделение маркерами (`before`/`after`).
 ///
 /// Возвращает новый текст и позицию курсора в символах от начала замены:
@@ -86,25 +103,51 @@ pub(crate) fn wrap_selection_text(sel: &str, before: &str, after: &str) -> (Stri
     }
 }
 
-/// Вставляет горизонтальную линию `\n---\n` после строки, в которой стоит
-/// байтовый `end`. Выделенный текст не изменяется.
-/// Возвращает новый текст и позицию курсора в байтах.
+/// Что вставляет кнопка «—». Пустая строка перед `---` обязательна: строка
+/// `---` прямо под текстом по CommonMark делает этот текст заголовком H2
+/// (setext), а не рисует линию.
+const HORIZONTAL_RULE: &str = "\n\n---\n";
+
+/// Вставляет горизонтальную линию после строки, в которой стоит байтовый
+/// `end`, отделяя её пустой строкой. Выделенный текст не изменяется.
+/// Возвращает новый текст и позицию курсора в байтах (сразу после линии).
 pub(crate) fn insert_horizontal_rule(text: &str, end: usize) -> (String, usize) {
     let end = end.min(text.len());
     let line_end = text[end..]
         .find('\n')
         .map(|p| end + p)
         .unwrap_or(text.len());
-    let mut out = String::with_capacity(text.len() + 5);
+    let mut out = String::with_capacity(text.len() + HORIZONTAL_RULE.len());
     out.push_str(&text[..line_end]);
-    out.push_str("\n---\n");
+    out.push_str(HORIZONTAL_RULE);
     out.push_str(&text[line_end..]);
-    (out, line_end + 5)
+    (out, line_end + HORIZONTAL_RULE.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn b2_toggle_task_at_marker() {
+        let mut t = String::from("- [ ] a\n- [X] b\n");
+        assert!(toggle_task_at(&mut t, 2));
+        assert_eq!(t, "- [x] a\n- [X] b\n");
+        assert!(toggle_task_at(&mut t, 10));
+        assert_eq!(t, "- [x] a\n- [ ] b\n");
+        assert!(toggle_task_at(&mut t, 2));
+        assert_eq!(t, "- [ ] a\n- [ ] b\n");
+    }
+
+    #[test]
+    fn b2_toggle_task_at_rejects_wrong_offset() {
+        let mut t = String::from("- [ ] задача");
+        let before = t.clone();
+        assert!(!toggle_task_at(&mut t, 0)); // не маркер
+        assert!(!toggle_task_at(&mut t, 7)); // внутри многобайтового символа
+        assert!(!toggle_task_at(&mut t, 100)); // за концом текста
+        assert_eq!(t, before);
+    }
 
     #[test]
     fn lines_range_does_not_panic_on_utf8() {
@@ -159,15 +202,37 @@ mod tests {
     fn insert_horizontal_rule_after_the_last_line() {
         // Линия ставится после строки, в которой стоит курсор; текст не трогаем.
         let (text, cursor) = insert_horizontal_rule("abc", 1);
-        assert_eq!(text, "abc\n---\n");
-        assert_eq!(cursor, 8);
+        assert_eq!(text, "abc\n\n---\n");
+        assert_eq!(cursor, 9);
 
         let (text, cursor) = insert_horizontal_rule("abc\ndef", 1);
-        assert_eq!(text, "abc\n---\n\ndef");
-        assert_eq!(cursor, 8);
+        assert_eq!(text, "abc\n\n---\n\ndef");
+        assert_eq!(cursor, 9);
 
         // Выделение внутри последней строки — линия всё равно после неё.
         let (text, _) = insert_horizontal_rule("a\nbb\nc", 4);
-        assert_eq!(text, "a\nbb\n---\n\nc");
+        assert_eq!(text, "a\nbb\n\n---\n\nc");
+    }
+
+    /// Что из вставленного видит парсер: линию или заголовок.
+    fn block_kinds(md: &str) -> Vec<&'static str> {
+        use pulldown_cmark::{Event, Parser, Tag};
+        Parser::new_ext(md, markdown::cmark_options())
+            .filter_map(|e| match e {
+                Event::Rule => Some("rule"),
+                Event::Start(Tag::Heading { .. }) => Some("heading"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inserted_rule_is_a_rule_not_a_setext_heading() {
+        // Регрессия: `abc\n---` — это заголовок H2 «abc», а не линия.
+        assert_eq!(block_kinds("abc\n---\n"), vec!["heading"]);
+        for (text, at) in [("abc", 3), ("abc\ndef", 1), ("a\nbb\nc", 4), ("", 0)] {
+            let (out, _) = insert_horizontal_rule(text, at);
+            assert_eq!(block_kinds(&out), vec!["rule"], "{out:?}");
+        }
     }
 }

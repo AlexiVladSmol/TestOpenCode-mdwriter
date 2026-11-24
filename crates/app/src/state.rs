@@ -10,12 +10,34 @@ use graph::GraphView;
 use index::Index;
 use vault::{Vault, VaultError, VaultWatcher};
 
-use crate::format::{self, lines_range};
+use crate::format::{self, lines_range, toggle_task_at};
 use crate::notice::Notices;
 use crate::sync::{self, Reconcile};
 use crate::tree;
 
 pub(crate) const AUTOSAVE_DELAY: f64 = 1.0;
+
+/// Через сколько секунд после первого события наблюдателя пересканировать
+/// vault: одно сохранение даёт серию событий (временный файл, rename…),
+/// и все они схлопываются в одно пересканирование.
+const RESCAN_DELAY: f64 = 0.3;
+
+/// Планировщик пересканирования. `pending` — запланированное время,
+/// `changed` — пришли ли новые события. Возвращает новое запланированное
+/// время и пора ли пересканировать сейчас. Отсчёт идёт от первого события,
+/// поэтому непрерывный поток изменений не откладывает пересканирование
+/// бесконечно.
+fn rescan_schedule(pending: Option<f64>, changed: bool, now: f64) -> (Option<f64>, bool) {
+    let pending = match pending {
+        Some(t) => Some(t),
+        None if changed => Some(now + RESCAN_DELAY),
+        None => None,
+    };
+    match pending {
+        Some(t) if now >= t => (None, true),
+        p => (p, false),
+    }
+}
 
 /// Фиксированный id редактора — для доступа к состоянию TextEdit (курсор/выделение).
 const EDITOR_ID_SRC: &str = "mdwriter_editor";
@@ -76,6 +98,10 @@ pub(crate) struct VaultState {
     pub(crate) conflict: bool,
     /// Файл удалён/переименован извне, а в редакторе есть несохранённые правки.
     pub(crate) orphaned: bool,
+    /// Когда пересканировать vault после событий наблюдателя (см. `poll_watcher`).
+    pub(crate) pending_rescan_at: Option<f64>,
+    /// Предупреждения индекса, о которых уже сообщили (см. `report_index_warnings`).
+    reported_index_warnings: Vec<String>,
     pub(crate) last_edit: Option<f64>,
     pub(crate) new_note_name: String,
     pub(crate) view_mode: ViewMode,
@@ -105,6 +131,8 @@ impl VaultState {
             disk_text: None,
             conflict: false,
             orphaned: false,
+            pending_rescan_at: None,
+            reported_index_warnings: Vec::new(),
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
@@ -147,8 +175,16 @@ impl VaultState {
     /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
     /// У `Notice` нет отдельного поля под подробности, поэтому первые
     /// несколько путей попадают в текст сообщения.
+    ///
+    /// Сообщает только когда список проблем **изменился**: пересканирование
+    /// идёт после каждого автосохранения (B7), и без этой проверки одно и то
+    /// же уведомление висело бы постоянно с растущим счётчиком.
     fn report_index_warnings(&mut self) {
         let warnings = self.index.warnings();
+        if warnings == self.reported_index_warnings.as_slice() {
+            return;
+        }
+        self.reported_index_warnings = warnings.to_vec();
         if warnings.is_empty() {
             return;
         }
@@ -435,6 +471,20 @@ impl VaultState {
         }
     }
 
+    /// Забирает события наблюдателя за файлами и пересканирует vault через
+    /// `RESCAN_DELAY` после первого из них. Вызывать раз в кадр.
+    pub(crate) fn poll_watcher(&mut self, now: f64, ctx: &egui::Context) {
+        let changed = !self.watcher.take_changes().is_empty();
+        let (pending, due) = rescan_schedule(self.pending_rescan_at, changed, now);
+        self.pending_rescan_at = pending;
+        if due {
+            self.rescan();
+        } else if let Some(t) = pending {
+            // Кадр нужен к назначенному времени, даже если пользователь бездействует.
+            ctx.request_repaint_after(Duration::from_secs_f64((t - now).max(0.0)));
+        }
+    }
+
     pub(crate) fn maybe_autosave(&mut self, now: f64, ctx: &egui::Context) {
         // При конфликте ждём решения пользователя (полоса над редактором).
         if !self.dirty || self.conflict || self.orphaned {
@@ -486,6 +536,16 @@ impl VaultState {
                 }
                 // Якорь (`#…`) в имя файла не попадает; `[[#Заголовок]]` ничего не создаёт.
                 let rel = new_note_path(&from, target)?;
+                // Те же правила имени, что и для поля «новая заметка» (B4):
+                // `[[CON]]`, `[[a?b]]`, `[[x:y]]` не должны создавать файлы.
+                let rel = match validate_note_name(&rel.to_string_lossy()) {
+                    Ok(rel) => rel,
+                    Err(msg) => {
+                        self.notices
+                            .error(format!("Заметка «{target}» не создана: {msg}"));
+                        return None;
+                    }
+                };
                 match self.vault.create(&rel) {
                     Ok(()) => {
                         self.rescan();
@@ -502,44 +562,15 @@ impl VaultState {
         }
     }
 
-    /// Переключает `[ ]` ↔ `[x]` в исходнике по индексу строки тела документа.
-    fn toggle_task(&mut self, line_in_body: usize) {
-        // Смещение строки из-за frontmatter.
-        let fm_lines = match markdown::split_frontmatter(&self.editor_text) {
-            Some((_, body)) => {
-                let consumed = self.editor_text.len() - body.len();
-                self.editor_text[..consumed]
-                    .bytes()
-                    .filter(|&b| b == b'\n')
-                    .count()
-            }
-            None => 0,
-        };
-        let line_idx = fm_lines + line_in_body;
-
-        // Начало и конец целевой строки.
-        let mut start = 0;
-        for _ in 0..line_idx {
-            let Some(rel) = self.editor_text[start..].find('\n') else {
-                return;
-            };
-            start += rel + 1;
-        }
-        let line_end = self.editor_text[start..]
-            .find('\n')
-            .map(|r| start + r)
-            .unwrap_or(self.editor_text.len());
-
-        let line = &self.editor_text[start..line_end];
-        for pat in ["[ ]", "[x]", "[X]"] {
-            if let Some(pos) = line.find(pat) {
-                let abs = start + pos;
-                let replacement = if pat == "[ ]" { "[x]" } else { "[ ]" };
-                self.editor_text.replace_range(abs..abs + 3, replacement);
-                self.dirty = true;
-                self.last_edit = None; // автосохранение сработает сразу
-                return;
-            }
+    /// Переключает `[ ]` ↔ `[x]` у маркера задачи по байтовому смещению
+    /// во всём тексте (его даёт предпросмотр).
+    fn toggle_task(&mut self, offset: usize) {
+        if toggle_task_at(&mut self.editor_text, offset) {
+            self.dirty = true;
+            self.last_edit = None; // автосохранение сработает сразу
+        } else {
+            self.notices
+                .info("Задача не переключена: текст изменился, повторите клик");
         }
     }
 
@@ -834,8 +865,8 @@ impl VaultState {
                         self.load(rel);
                     }
                 }
-                preview::Action::ToggleTask { line_in_body } => {
-                    self.toggle_task(line_in_body);
+                preview::Action::ToggleTask { offset } => {
+                    self.toggle_task(offset);
                 }
             }
         }
@@ -1056,7 +1087,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.md"), "исходный").unwrap();
-        let watcher = VaultWatcher::new(&dir).unwrap();
+        let watcher = VaultWatcher::new(&dir, || {}).unwrap();
         let mut vs = VaultState::open(Vault::open(dir.clone()), watcher, Notices::default());
         vs.load(PathBuf::from("a.md"));
         assert_eq!(vs.editor_text, "исходный");
@@ -1214,5 +1245,151 @@ mod tests {
         vs.load(PathBuf::from("b.md"));
         assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
         assert_eq!(vs.editor_text, "мои");
+    }
+
+    // ------------- Ревью этапа 3: доработки B4 и B5 -------------
+
+    #[test]
+    fn b4_wikilink_cannot_create_invalid_note_names() {
+        let (mut vs, dir) = open_a();
+        for bad in ["CON", "a?b", "x:y", "../вне"] {
+            let action = preview::Action::OpenWiki(bad.to_string());
+            assert_eq!(vs.open_wiki(&action), None, "{bad:?} не должна создаваться");
+        }
+        // Внутри vault появилась только исходная заметка.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.md".to_string()]);
+        // Обычная цель по-прежнему создаётся (как в Obsidian).
+        let ok = preview::Action::OpenWiki("Новая заметка".to_string());
+        assert_eq!(vs.open_wiki(&ok), Some(PathBuf::from("Новая заметка.md")));
+        assert!(dir.join("Новая заметка.md").exists());
+    }
+
+    /// Уведомления о пропущенных файлах индекса.
+    fn skipped_notices(vs: &VaultState) -> Vec<crate::notice::Notice> {
+        vs.notices
+            .items()
+            .into_iter()
+            .filter(|n| n.text.starts_with("Пропущено файлов"))
+            .collect()
+    }
+
+    #[test]
+    fn b5_index_warning_is_reported_once_per_change() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        vs.rescan();
+        // Повторные пересканирования (как после каждого автосохранения)
+        // не повторяют то же уведомление.
+        vs.rescan();
+        vs.rescan();
+        let n = skipped_notices(&vs);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].repeats, 1);
+        assert!(n[0].text.starts_with("Пропущено файлов: 1"));
+
+        // Список изменился — новое уведомление.
+        std::fs::write(dir.join("bad2.md"), [0xFFu8]).unwrap();
+        vs.rescan();
+        assert!(skipped_notices(&vs)
+            .iter()
+            .any(|n| n.text.starts_with("Пропущено файлов: 2")));
+
+        // Проблемы ушли и вернулись — снова сообщаем.
+        std::fs::remove_file(dir.join("bad.md")).unwrap();
+        std::fs::remove_file(dir.join("bad2.md")).unwrap();
+        vs.rescan();
+        std::fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        vs.rescan();
+        let last = skipped_notices(&vs);
+        assert!(last
+            .iter()
+            .any(|n| n.text.starts_with("Пропущено файлов: 1")));
+    }
+
+    // ------------------- B7: наблюдатель и пересканирование -------------------
+
+    #[test]
+    fn b7_schedule_waits_from_first_event() {
+        // Ничего не пришло — ничего не планируем.
+        assert_eq!(rescan_schedule(None, false, 1.0), (None, false));
+        // Первое событие — пересканирование через RESCAN_DELAY.
+        let (p, due) = rescan_schedule(None, true, 1.0);
+        assert_eq!((p, due), (Some(1.0 + RESCAN_DELAY), false));
+        // Новые события не откладывают уже назначенное время.
+        assert_eq!(rescan_schedule(p, true, 1.2), (p, false));
+        // Время пришло — пересканировать и сбросить план.
+        assert_eq!(rescan_schedule(p, false, 1.0 + RESCAN_DELAY), (None, true));
+    }
+
+    #[test]
+    fn b7_external_change_reaches_editor_through_watcher() {
+        use std::time::{Duration, Instant};
+
+        let (mut vs, dir) = open_a();
+        let ctx = egui::Context::default();
+        std::fs::write(dir.join("a.md"), "извне").unwrap();
+
+        // Ждём, пока событие дойдёт и пересканирование будет запланировано.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vs.pending_rescan_at.is_none() && Instant::now() < deadline {
+            vs.poll_watcher(0.0, &ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(vs.pending_rescan_at, Some(RESCAN_DELAY));
+        // До срока ничего не меняется.
+        vs.poll_watcher(RESCAN_DELAY / 2.0, &ctx);
+        assert_eq!(vs.editor_text, "исходный");
+        // В срок — пересканирование, A3 перезагружает чистую заметку.
+        vs.poll_watcher(RESCAN_DELAY, &ctx);
+        assert_eq!(vs.pending_rescan_at, None);
+        assert_eq!(vs.editor_text, "извне");
+    }
+
+    // ------------------- B2: переключение задач -------------------
+
+    /// Документ, на котором старый построчный поиск переключал не ту задачу:
+    /// frontmatter, задача в цитате (её не видел счётчик строк) и `[ ]` в
+    /// тексте задачи.
+    const B2_DOC: &str =
+        "---\ntitle: Т\n---\n> - [ ] в цитате\n\n- [x] купить [ ] хлеб\n10. [ ] десятая\n";
+
+    #[test]
+    fn b2_click_toggles_exactly_that_task() {
+        let (mut vs, _dir) = open_a();
+        vs.editor_text = B2_DOC.to_string();
+        let offsets = preview::document_task_offsets(&vs.editor_text);
+        assert_eq!(offsets.len(), 3);
+
+        // Клик по второму чекбоксу («купить»): меняется только её маркер.
+        vs.toggle_task(offsets[1]);
+        assert_eq!(
+            vs.editor_text,
+            "---\ntitle: Т\n---\n> - [ ] в цитате\n\n- [ ] купить [ ] хлеб\n10. [ ] десятая\n"
+        );
+        assert!(vs.dirty);
+
+        // Третий («десятая», список с номером 10).
+        vs.toggle_task(offsets[2]);
+        assert!(vs.editor_text.ends_with("10. [x] десятая\n"));
+        // Первый — в цитате.
+        vs.toggle_task(offsets[0]);
+        assert!(vs.editor_text.contains("> - [x] в цитате"));
+    }
+
+    #[test]
+    fn b2_stale_offset_changes_nothing() {
+        let (mut vs, _dir) = open_a();
+        vs.editor_text = B2_DOC.to_string();
+        let offsets = preview::document_task_offsets(&vs.editor_text);
+        // Пользователь успел дописать текст в начало — смещение устарело.
+        vs.editor_text.insert(0, 'x');
+        vs.dirty = false;
+        vs.toggle_task(offsets[1]);
+        assert_eq!(vs.editor_text, format!("x{B2_DOC}"));
+        assert!(!vs.dirty);
     }
 }
