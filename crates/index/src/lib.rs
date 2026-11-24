@@ -4,12 +4,53 @@
 //! ([`Index::build`]) и хранятся в картах, поэтому `resolve_wikilink`,
 //! `backlinks` и `links` работают без перебора всех заметок — их можно
 //! вызывать хоть в каждом кадре UI.
+//!
+//! После построения индекс обновляется частично ([`Index::apply`]): меняются
+//! только затронутые заметки, а производные карты пересчитываются один раз
+//! на пакет изменений — без повторного чтения всего vault с диска.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vault::{Result, Vault};
+
+/// Изменение одной заметки для [`Index::apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteChange {
+    /// Заметка появилась или изменилась. `lossy` — текст прочитан с заменой
+    /// невалидных байт UTF-8 (о такой заметке будет предупреждение).
+    Upsert {
+        rel: PathBuf,
+        text: String,
+        lossy: bool,
+    },
+    /// Заметки больше нет.
+    Remove(PathBuf),
+    /// Файл есть, но прочитать его не удалось: старое содержимое в индексе
+    /// остаётся, причина попадает в предупреждения.
+    Unreadable { rel: PathBuf, error: String },
+}
+
+impl NoteChange {
+    /// Изменение по текущему состоянию файла `rel` на диске.
+    pub fn from_disk(vault: &Vault, rel: &Path) -> NoteChange {
+        if !vault.abs_path(rel).is_file() {
+            return NoteChange::Remove(rel.to_path_buf());
+        }
+        match vault.read_lossy(rel) {
+            Ok((text, lossy)) => NoteChange::Upsert {
+                rel: rel.to_path_buf(),
+                text,
+                lossy,
+            },
+            Err(e) => NoteChange::Unreadable {
+                rel: rel.to_path_buf(),
+                error: e.to_string(),
+            },
+        }
+    }
+}
 
 /// Источник номеров поколений: уникален для всех экземпляров `Index`, чтобы
 /// кеш, привязанный к поколению, не «узнал» новый индекс после пересборки.
@@ -41,8 +82,11 @@ pub struct Index {
     backlinks: HashMap<PathBuf, Vec<PathBuf>>,
     /// Номер поколения: меняется при каждом изменении индекса.
     generation: u64,
-    /// Проблемы последнего построения: пропущенные/нечитаемые файлы.
-    warnings: Vec<String>,
+    /// Проблемы обхода vault при последнем полном построении.
+    walk_warnings: Vec<String>,
+    /// Проблемы отдельных файлов (не UTF-8, не читается) — обновляются и при
+    /// частичных изменениях.
+    file_warnings: BTreeMap<PathBuf, String>,
 }
 
 impl Index {
@@ -53,29 +97,98 @@ impl Index {
     /// заменами (поиск и ссылки продолжают работать).
     pub fn build(vault: &Vault) -> Result<Index> {
         let mut index = Index::default();
-        let (notes, mut warnings) = vault.list_notes()?;
+        let (notes, walk_warnings) = vault.list_notes()?;
+        index.walk_warnings = walk_warnings;
         for rel in notes {
-            match vault.read_lossy(&rel) {
-                Ok((text, had_invalid_bytes)) => {
-                    if had_invalid_bytes {
-                        warnings.push(format!(
-                            "{}: не UTF-8, текст прочитан с заменами",
-                            rel.display()
-                        ));
-                    }
-                    index.add_note(rel, text);
-                }
-                Err(e) => warnings.push(format!("{}: {e}", rel.display())),
-            }
+            let change = NoteChange::from_disk(vault, &rel);
+            index.apply_one(change);
         }
-        index.warnings = warnings;
         index.rebuild_derived();
         Ok(index)
     }
 
-    /// Предупреждения последнего [`Index::build`]: пропущенные и битые файлы.
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
+    /// Предупреждения: проблемы обхода vault и отдельных файлов (пропущенные
+    /// и битые файлы), в стабильном порядке.
+    pub fn warnings(&self) -> Vec<String> {
+        self.walk_warnings
+            .iter()
+            .cloned()
+            .chain(self.file_warnings.values().cloned())
+            .collect()
+    }
+
+    /// Есть ли заметка `rel` в индексе.
+    pub fn contains(&self, rel: &Path) -> bool {
+        self.notes.contains_key(rel)
+    }
+
+    /// Пути всех заметок, по алфавиту.
+    pub fn note_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.notes.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    /// Применяет пакет изменений. Производные данные пересчитываются один раз
+    /// и только если что-то изменилось. Возвращает, изменился ли индекс.
+    pub fn apply(&mut self, changes: impl IntoIterator<Item = NoteChange>) -> bool {
+        let mut changed = false;
+        for change in changes {
+            changed |= self.apply_one(change);
+        }
+        if changed {
+            self.rebuild_derived();
+        }
+        changed
+    }
+
+    /// Добавляет или обновляет одну заметку (например, после сохранения из
+    /// редактора — без чтения с диска).
+    pub fn upsert(&mut self, rel: PathBuf, text: String) -> bool {
+        self.apply([NoteChange::Upsert {
+            rel,
+            text,
+            lossy: false,
+        }])
+    }
+
+    /// Убирает заметку из индекса.
+    pub fn remove(&mut self, rel: &Path) -> bool {
+        self.apply([NoteChange::Remove(rel.to_path_buf())])
+    }
+
+    /// Одно изменение без пересчёта производных данных. Возвращает, менялись
+    /// ли заметки (предупреждения на поколение не влияют).
+    fn apply_one(&mut self, change: NoteChange) -> bool {
+        match change {
+            NoteChange::Upsert { rel, text, lossy } => {
+                if lossy {
+                    self.file_warnings.insert(
+                        rel.clone(),
+                        format!("{}: не UTF-8, текст прочитан с заменами", rel.display()),
+                    );
+                } else {
+                    self.file_warnings.remove(&rel);
+                }
+                // Тот же текст (например, событие о нашей же записи) — индекс
+                // не трогаем, поколение не меняется.
+                if self.contents.get(&rel) == Some(&text) {
+                    return false;
+                }
+                self.add_note(rel, text);
+                true
+            }
+            NoteChange::Remove(rel) => {
+                self.file_warnings.remove(&rel);
+                self.contents.remove(&rel);
+                self.notes.remove(&rel).is_some()
+            }
+            NoteChange::Unreadable { rel, error } => {
+                self.file_warnings
+                    .insert(rel.clone(), format!("{}: {error}", rel.display()));
+                false
+            }
+        }
     }
 
     /// Добавляет (или заменяет) заметку без пересчёта производных данных.
@@ -631,6 +744,144 @@ mod tests {
         let b = mem(&[("a.md", "")]);
         assert_ne!(a.generation(), 0);
         assert_ne!(a.generation(), b.generation());
+    }
+
+    // ------------------- C3: частичное обновление -------------------
+
+    #[test]
+    fn c3_upsert_and_remove_update_links_and_backlinks() {
+        let mut index = mem(&[("a.md", "[[b]]"), ("b.md", "текст")]);
+        assert_eq!(
+            index.backlinks(Path::new("b.md")),
+            vec![PathBuf::from("a.md")]
+        );
+
+        // Новая заметка со ссылкой — backlinks пересчитаны.
+        let g = index.generation();
+        assert!(index.upsert(PathBuf::from("c.md"), "[[b]] и [[a]]".into()));
+        assert_ne!(index.generation(), g);
+        assert_eq!(
+            index.backlinks(Path::new("b.md")),
+            vec![PathBuf::from("a.md"), PathBuf::from("c.md")]
+        );
+        assert_eq!(
+            index.backlinks(Path::new("a.md")),
+            vec![PathBuf::from("c.md")]
+        );
+
+        // Ссылку убрали из текста — обратная ссылка исчезла.
+        assert!(index.upsert(PathBuf::from("a.md"), "без ссылок".into()));
+        assert_eq!(
+            index.backlinks(Path::new("b.md")),
+            vec![PathBuf::from("c.md")]
+        );
+
+        // Заметку удалили — она пропала отовсюду, ссылки на неё не разрешаются.
+        assert!(index.remove(Path::new("b.md")));
+        assert!(!index.contains(Path::new("b.md")));
+        assert!(index.links(Path::new("c.md")) == [PathBuf::from("a.md")]);
+        assert_eq!(index.search("текст", 10).len(), 0);
+        assert_eq!(
+            index.note_paths(),
+            vec![PathBuf::from("a.md"), PathBuf::from("c.md")]
+        );
+    }
+
+    #[test]
+    fn c3_partial_update_matches_full_build() {
+        // Частичное обновление даёт тот же результат, что и построение с нуля.
+        let mut notes = generated(120, 6);
+        let mut index = mem_index(&notes);
+        let mut changes = Vec::new();
+        for i in (0..notes.len()).step_by(7) {
+            notes[i].1.push_str(&format!("\nдобавлено [[n{}]]", i % 13));
+            changes.push(NoteChange::Upsert {
+                rel: PathBuf::from(&notes[i].0),
+                text: notes[i].1.clone(),
+                lossy: false,
+            });
+        }
+        let removed = notes.remove(5);
+        changes.push(NoteChange::Remove(PathBuf::from(&removed.0)));
+        assert!(index.apply(changes));
+
+        let fresh = mem_index(&notes);
+        assert_eq!(index.note_paths(), fresh.note_paths());
+        for rel in fresh.note_paths() {
+            assert_eq!(index.links(&rel), fresh.links(&rel), "links {rel:?}");
+            assert_eq!(
+                index.backlinks(&rel),
+                fresh.backlinks(&rel),
+                "backlinks {rel:?}"
+            );
+            assert_eq!(index.title(&rel), fresh.title(&rel));
+        }
+    }
+
+    #[test]
+    fn c3_same_text_does_not_bump_generation() {
+        let mut index = mem(&[("a.md", "текст")]);
+        let g = index.generation();
+        // Событие о нашей же записи: тот же текст — индекс не трогаем.
+        assert!(!index.upsert(PathBuf::from("a.md"), "текст".into()));
+        assert!(!index.remove(Path::new("нет.md")));
+        assert_eq!(index.generation(), g);
+    }
+
+    #[test]
+    fn c3_file_warnings_follow_partial_updates() {
+        let mut index = mem(&[("a.md", "текст")]);
+        index.apply([NoteChange::Upsert {
+            rel: PathBuf::from("bad.md"),
+            text: "�".into(),
+            lossy: true,
+        }]);
+        assert_eq!(index.warnings().len(), 1);
+        assert!(index.warnings()[0].contains("bad.md"));
+
+        // Файл исправили — предупреждение ушло.
+        index.apply([NoteChange::Upsert {
+            rel: PathBuf::from("bad.md"),
+            text: "исправлено".into(),
+            lossy: false,
+        }]);
+        assert!(index.warnings().is_empty());
+
+        // Файл перестал читаться: старое содержимое остаётся, есть предупреждение.
+        index.apply([NoteChange::Unreadable {
+            rel: PathBuf::from("a.md"),
+            error: "нет доступа".into(),
+        }]);
+        assert!(index.contains(Path::new("a.md")));
+        assert_eq!(index.search("текст", 10).len(), 1);
+        assert!(index.warnings()[0].contains("нет доступа"));
+
+        // Файл удалили — предупреждение тоже ушло.
+        index.remove(Path::new("a.md"));
+        assert!(index.warnings().is_empty());
+    }
+
+    #[test]
+    fn c3_note_change_from_disk() {
+        let (vault, dir) = test_vault();
+        vault.write(Path::new("a.md"), "текст").unwrap();
+        std::fs::write(dir.join("bad.md"), [0xC0u8]).unwrap();
+        assert_eq!(
+            NoteChange::from_disk(&vault, Path::new("a.md")),
+            NoteChange::Upsert {
+                rel: PathBuf::from("a.md"),
+                text: "текст".into(),
+                lossy: false
+            }
+        );
+        assert!(matches!(
+            NoteChange::from_disk(&vault, Path::new("bad.md")),
+            NoteChange::Upsert { lossy: true, .. }
+        ));
+        assert_eq!(
+            NoteChange::from_disk(&vault, Path::new("нет.md")),
+            NoteChange::Remove(PathBuf::from("нет.md"))
+        );
     }
 
     /// Замер «до/после» (не входит в обычный прогон):
