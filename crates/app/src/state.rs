@@ -100,6 +100,8 @@ pub(crate) struct VaultState {
     pub(crate) orphaned: bool,
     /// Когда пересканировать vault после событий наблюдателя (см. `poll_watcher`).
     pub(crate) pending_rescan_at: Option<f64>,
+    /// Предупреждения индекса, о которых уже сообщили (см. `report_index_warnings`).
+    reported_index_warnings: Vec<String>,
     pub(crate) last_edit: Option<f64>,
     pub(crate) new_note_name: String,
     pub(crate) view_mode: ViewMode,
@@ -130,6 +132,7 @@ impl VaultState {
             conflict: false,
             orphaned: false,
             pending_rescan_at: None,
+            reported_index_warnings: Vec::new(),
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
@@ -172,8 +175,16 @@ impl VaultState {
     /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
     /// У `Notice` нет отдельного поля под подробности, поэтому первые
     /// несколько путей попадают в текст сообщения.
+    ///
+    /// Сообщает только когда список проблем **изменился**: пересканирование
+    /// идёт после каждого автосохранения (B7), и без этой проверки одно и то
+    /// же уведомление висело бы постоянно с растущим счётчиком.
     fn report_index_warnings(&mut self) {
         let warnings = self.index.warnings();
+        if warnings == self.reported_index_warnings.as_slice() {
+            return;
+        }
+        self.reported_index_warnings = warnings.to_vec();
         if warnings.is_empty() {
             return;
         }
@@ -525,6 +536,16 @@ impl VaultState {
                 }
                 // Якорь (`#…`) в имя файла не попадает; `[[#Заголовок]]` ничего не создаёт.
                 let rel = new_note_path(&from, target)?;
+                // Те же правила имени, что и для поля «новая заметка» (B4):
+                // `[[CON]]`, `[[a?b]]`, `[[x:y]]` не должны создавать файлы.
+                let rel = match validate_note_name(&rel.to_string_lossy()) {
+                    Ok(rel) => rel,
+                    Err(msg) => {
+                        self.notices
+                            .error(format!("Заметка «{target}» не создана: {msg}"));
+                        return None;
+                    }
+                };
                 match self.vault.create(&rel) {
                     Ok(()) => {
                         self.rescan();
@@ -1224,6 +1245,69 @@ mod tests {
         vs.load(PathBuf::from("b.md"));
         assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
         assert_eq!(vs.editor_text, "мои");
+    }
+
+    // ------------- Ревью этапа 3: доработки B4 и B5 -------------
+
+    #[test]
+    fn b4_wikilink_cannot_create_invalid_note_names() {
+        let (mut vs, dir) = open_a();
+        for bad in ["CON", "a?b", "x:y", "../вне"] {
+            let action = preview::Action::OpenWiki(bad.to_string());
+            assert_eq!(vs.open_wiki(&action), None, "{bad:?} не должна создаваться");
+        }
+        // Внутри vault появилась только исходная заметка.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.md".to_string()]);
+        // Обычная цель по-прежнему создаётся (как в Obsidian).
+        let ok = preview::Action::OpenWiki("Новая заметка".to_string());
+        assert_eq!(vs.open_wiki(&ok), Some(PathBuf::from("Новая заметка.md")));
+        assert!(dir.join("Новая заметка.md").exists());
+    }
+
+    /// Уведомления о пропущенных файлах индекса.
+    fn skipped_notices(vs: &VaultState) -> Vec<crate::notice::Notice> {
+        vs.notices
+            .items()
+            .into_iter()
+            .filter(|n| n.text.starts_with("Пропущено файлов"))
+            .collect()
+    }
+
+    #[test]
+    fn b5_index_warning_is_reported_once_per_change() {
+        let (mut vs, dir) = open_a();
+        std::fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        vs.rescan();
+        // Повторные пересканирования (как после каждого автосохранения)
+        // не повторяют то же уведомление.
+        vs.rescan();
+        vs.rescan();
+        let n = skipped_notices(&vs);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].repeats, 1);
+        assert!(n[0].text.starts_with("Пропущено файлов: 1"));
+
+        // Список изменился — новое уведомление.
+        std::fs::write(dir.join("bad2.md"), [0xFFu8]).unwrap();
+        vs.rescan();
+        assert!(skipped_notices(&vs)
+            .iter()
+            .any(|n| n.text.starts_with("Пропущено файлов: 2")));
+
+        // Проблемы ушли и вернулись — снова сообщаем.
+        std::fs::remove_file(dir.join("bad.md")).unwrap();
+        std::fs::remove_file(dir.join("bad2.md")).unwrap();
+        vs.rescan();
+        std::fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        vs.rescan();
+        let last = skipped_notices(&vs);
+        assert!(last
+            .iter()
+            .any(|n| n.text.starts_with("Пропущено файлов: 1")));
     }
 
     // ------------------- B7: наблюдатель и пересканирование -------------------
