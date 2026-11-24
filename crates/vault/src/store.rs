@@ -67,6 +67,9 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 pub enum VaultError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Путь выходит за пределы vault или не является корректным относительным.
+    #[error("недопустимый путь внутри vault: {0}")]
+    InvalidPath(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -93,8 +96,28 @@ impl Vault {
             .unwrap_or_else(|_| abs.to_path_buf())
     }
 
+    /// Абсолютный путь для отображения/проверок. Для файловых операций
+    /// используйте [`Vault::checked_path`]: здесь нет защиты от `..`.
     pub fn abs_path(&self, rel: &Path) -> PathBuf {
         self.root.join(rel)
+    }
+
+    /// Проверяет, что `rel` — корректный относительный путь внутри vault,
+    /// и возвращает абсолютный путь. `..`, абсолютные пути и префиксы диска
+    /// отклоняются (`VaultError::InvalidPath`).
+    fn checked_path(&self, rel: &Path) -> Result<PathBuf> {
+        let mut has_normal = false;
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(_) => has_normal = true,
+                std::path::Component::CurDir => {}
+                _ => return Err(VaultError::InvalidPath(rel.to_path_buf())),
+            }
+        }
+        if !has_normal {
+            return Err(VaultError::InvalidPath(rel.to_path_buf()));
+        }
+        Ok(self.root.join(rel))
     }
 
     /// Рекурсивный список всех `.md` файлов (относительные пути, отсортированы).
@@ -126,12 +149,12 @@ impl Vault {
     }
 
     pub fn read(&self, rel: &Path) -> Result<String> {
-        Ok(fs::read_to_string(self.abs_path(rel))?)
+        Ok(fs::read_to_string(self.checked_path(rel)?)?)
     }
 
     /// Атомарная запись: пишем во временный файл в той же папке, затем rename.
     pub fn write(&self, rel: &Path, content: &str) -> Result<()> {
-        let abs = self.abs_path(rel);
+        let abs = self.checked_path(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -142,7 +165,7 @@ impl Vault {
     /// Создать новый (пустой) файл заметки, создавая родительские папки.
     /// Если файл уже существует — ничего не делает (содержимое не трогается).
     pub fn create(&self, rel: &Path) -> Result<()> {
-        let abs = self.abs_path(rel);
+        let abs = self.checked_path(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -303,5 +326,35 @@ mod tests {
         vault.create(Path::new("note.md")).unwrap();
 
         assert_eq!(vault.read(Path::new("note.md")).unwrap(), "важное");
+    }
+
+    fn is_invalid_path<T: std::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(VaultError::InvalidPath(_)))
+    }
+
+    #[test]
+    fn paths_outside_vault_are_rejected() {
+        let (vault, _dir) = temp_vault();
+        assert!(is_invalid_path(vault.read(Path::new("../x.md"))));
+        assert!(is_invalid_path(vault.write(Path::new("../x.md"), "x")));
+        assert!(is_invalid_path(vault.create(Path::new("../../x.md"))));
+        assert!(is_invalid_path(vault.read(Path::new("/etc/x.md"))));
+        assert!(is_invalid_path(vault.write(Path::new("/etc/x.md"), "x")));
+        assert!(is_invalid_path(vault.create(Path::new(""))));
+        #[cfg(windows)]
+        {
+            assert!(is_invalid_path(vault.write(Path::new(r"C:\x.md"), "x")));
+            assert!(is_invalid_path(vault.create(Path::new(r"C:\temp\x.md"))));
+        }
+        // Ничего не создано вне vault.
+        assert!(!std::env::temp_dir().join("x.md").exists());
+    }
+
+    #[test]
+    fn dot_components_inside_vault_are_allowed() {
+        let (vault, dir) = temp_vault();
+        vault.write(Path::new("a/./b.md"), "ok").unwrap();
+        assert_eq!(vault.read(Path::new("a/b.md")).unwrap(), "ok");
+        assert!(dir.join("a").join("b.md").exists());
     }
 }

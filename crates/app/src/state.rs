@@ -435,16 +435,13 @@ impl VaultState {
     }
 
     pub(crate) fn create_note(&mut self) {
-        let name = self.new_note_name.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let name = if name.ends_with(".md") {
-            name
-        } else {
-            format!("{name}.md")
+        let rel = match validate_note_name(&self.new_note_name) {
+            Ok(rel) => rel,
+            Err(msg) => {
+                self.notices.error(msg);
+                return;
+            }
         };
-        let rel = PathBuf::from(name);
         if let Err(e) = self.vault.create(&rel) {
             self.notices
                 .error(format!("Не удалось создать {}: {e}", rel.display()));
@@ -829,6 +826,67 @@ pub(crate) fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
     Some(dir.join(name))
 }
 
+/// Проверяет имя новой заметки, введённое пользователем, и возвращает
+/// относительный путь внутри vault (с расширением `.md`, если его нет).
+///
+/// Запрещены: пустое имя, символы `<>:"|?*` и управляющие, пути вне vault,
+/// компоненты, заканчивающиеся точкой или пробелом, и зарезервированные
+/// имена Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
+pub(crate) fn validate_note_name(name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Имя заметки пустое".to_string());
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err("Имя содержит недопустимые символы: < > : \" | ? *".to_string());
+    }
+
+    let rel = Path::new(name);
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if part.ends_with('.') || part.ends_with(' ') {
+                    return Err(
+                        "Папка или файл не могут заканчиваться точкой или пробелом".to_string()
+                    );
+                }
+                let stem = Path::new(part.as_ref())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if is_reserved_windows_name(&stem) {
+                    return Err(format!("Имя «{stem}» зарезервировано в Windows"));
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err("Путь не должен выходить за пределы vault".to_string()),
+        }
+    }
+
+    let name = if name.to_lowercase().ends_with(".md") {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    };
+    Ok(PathBuf::from(name))
+}
+
+/// Зарезервированные имена устройств Windows (без учёта регистра и расширения).
+fn is_reserved_windows_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let bytes = upper.as_bytes();
+    bytes.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,6 +908,57 @@ mod tests {
         assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
         // Только якорь — создавать нечего.
         assert_eq!(new_note_path(from, "#Только якорь"), None);
+    }
+
+    // --------- B4: проверка имён новых заметок ---------
+
+    #[test]
+    fn validate_note_name_adds_extension() {
+        assert_eq!(
+            validate_note_name("  Заметка  "),
+            Ok(PathBuf::from("Заметка.md"))
+        );
+        assert_eq!(
+            validate_note_name("папка/заметка.md"),
+            Ok(PathBuf::from("папка/заметка.md"))
+        );
+        assert_eq!(validate_note_name("A.MD"), Ok(PathBuf::from("A.MD")));
+    }
+
+    #[test]
+    fn validate_note_name_rejects_bad_names() {
+        for bad in [
+            "",
+            "   ",
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "конец.",
+            "a /b",
+            "a./b",
+            "CON",
+            "nul.md",
+            "Com1",
+            "lpt9.markdown",
+            "..",
+            "../секрет",
+            "a/../b",
+            "/etc/passwd",
+            "C:\\Windows\\x",
+        ] {
+            assert!(
+                validate_note_name(bad).is_err(),
+                "имя {bad:?} должно быть отклонено"
+            );
+        }
+        // Символы внутри имени и «COM10» — допустимы.
+        assert!(validate_note_name("COM10").is_ok());
+        assert!(validate_note_name("conspect").is_ok());
+        assert!(validate_note_name("draft~1").is_ok());
     }
 
     // --------- A3: внешние изменения открытой заметки (на реальных файлах) ---------
