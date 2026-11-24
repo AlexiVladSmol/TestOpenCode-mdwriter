@@ -456,19 +456,24 @@ struct LowerText {
     lower: String,
     title_lower: String,
     /// Карта «байт в нижнем регистре → байт в исходной строке». `None`, когда
-    /// длины совпадают: тогда смещения те же и карта не нужна.
+    /// ни один символ не меняет длину при смене регистра: тогда смещения
+    /// совпадают и карта не нужна.
     map: Option<Vec<usize>>,
 }
 
 impl LowerText {
     fn new(text: &str, title: &str) -> Self {
-        let lower = text.to_lowercase();
-        // Обычный текст: `İ`, знак Кельвина и лигатуры — редкость, для них
-        // строим карту, для всего остального обходимся без неё.
-        let map = if lower.len() == text.len() {
-            None
+        // Сравнивать общие длины нельзя: `İ` удлиняется (2 → 3 байта), знак
+        // Кельвина укорачивается (3 → 1), и вместе они дают ту же длину —
+        // карта тогда не строится, а смещения уже не те.
+        let needs_map = text
+            .chars()
+            .any(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() != c.len_utf8());
+        let (lower, map) = if needs_map {
+            let (lower, map) = lower_with_map(text);
+            (lower, Some(map))
         } else {
-            Some(lower_with_map(text).1)
+            (text.to_lowercase(), None)
         };
         Self {
             lower,
@@ -1117,6 +1122,26 @@ mod tests {
         let kelvin = "\u{212A}ельвин";
         let changed = LowerText::new(kelvin, "");
         assert!(changed.map.is_some(), "знак Кельвина меняет длину");
+    }
+
+    /// Регрессия ревью: длина всего текста может совпасть случайно —
+    /// `İİ` удлиняется на 2 байта, знак Кельвина укорачивается на 2. Карта
+    /// всё равно нужна, иначе сниппет съезжает (6..9 вместо 4..7).
+    #[test]
+    fn lower_text_builds_the_map_when_only_the_total_length_matches() {
+        let text = "İİabc\u{212A}";
+        assert_eq!(
+            text.len(),
+            text.to_lowercase().len(),
+            "предпосылка теста: общие длины совпадают"
+        );
+
+        let lowered = LowerText::new(text, "");
+        assert!(
+            lowered.map.is_some(),
+            "общая длина совпала случайно — карта всё равно нужна"
+        );
+        assert_eq!(lowered.find(text, "abc"), Some(4..7));
     }
 
     #[test]
