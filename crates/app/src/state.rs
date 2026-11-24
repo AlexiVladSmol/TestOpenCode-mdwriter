@@ -751,7 +751,7 @@ impl VaultState {
 
             let theme =
                 egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
                 let mut job = egui_extras::syntax_highlighting::highlight(
                     ui.ctx(),
                     ui.style(),
@@ -759,11 +759,14 @@ impl VaultState {
                     buf.as_str(),
                     "md",
                 );
-                job.wrap.max_width = wrap_width;
+                // Перенос отключён: иначе длинные строки занимают несколько
+                // экранных строк, а номера в gutter не переносятся и «съезжают».
+                // Горизонтальная прокрутка — у ScrollArea::both.
+                job.wrap.max_width = f32::INFINITY;
                 ui.fonts_mut(|f| f.layout_job(job))
             };
 
-            let n_lines = self.editor_text.lines().count();
+            let n_lines = line_count(&self.editor_text);
             let digits = n_lines.to_string().len().max(2);
             let mut edit = egui::TextEdit::multiline(&mut self.editor_text)
                 .code_editor()
@@ -836,6 +839,12 @@ impl VaultState {
 /// Файл не удалось прочитать как UTF-8 (например, он в CP1251).
 fn is_utf8_error(e: &VaultError) -> bool {
     matches!(e, VaultError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData)
+}
+
+/// Количество строк для нумерации в редакторе: пустой документ — одна строка,
+/// последняя пустая строка после `\n` тоже считается.
+pub(crate) fn line_count(text: &str) -> usize {
+    text.split('\n').count()
 }
 
 /// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),
@@ -938,8 +947,20 @@ mod tests {
         assert_eq!(new_note_path(from, "#Только якорь"), None);
     }
 
-    // --------- B4: проверка имён новых заметок ---------
+    // --------- B10: количество строк для gutter ---------
 
+    #[test]
+    fn line_count_matches_editor_lines() {
+        // Пустой документ — одна строка.
+        assert_eq!(line_count(""), 1);
+        assert_eq!(line_count("одна"), 1);
+        // Последняя пустая строка после \n тоже считается.
+        assert_eq!(line_count("a\n"), 2);
+        assert_eq!(line_count("a\nb\nc\n"), 4);
+        assert_eq!(line_count("a\n\nb"), 3);
+    }
+
+    // --------- B4: проверка имён новых заметок ---------
     #[test]
     fn validate_note_name_adds_extension() {
         assert_eq!(
