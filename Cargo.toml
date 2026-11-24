@@ -6,7 +6,7 @@ members = ["crates/app", "crates/graph", "crates/index", "crates/markdown", "cra
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/AlexeiSmol/TestOpenCode-mdwriter"
+repository = "https://github.com/AlexiVladSmol/TestOpenCode-mdwriter"
 
 [workspace.dependencies]
 eframe = { version = "0.37", default-features = false, features = [
