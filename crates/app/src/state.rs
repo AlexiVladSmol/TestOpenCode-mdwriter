@@ -122,7 +122,7 @@ impl VaultState {
 
     pub(crate) fn rescan(&mut self) {
         match self.vault.list_notes() {
-            Ok(notes) => {
+            Ok((notes, _warnings)) => {
                 self.notes = notes;
                 self.tree = tree::build_tree(&self.notes);
             }
@@ -139,8 +139,26 @@ impl VaultState {
                 Index::default()
             }
         };
+        self.report_index_warnings();
         self.graph.update(&self.index);
         self.check_open_on_disk();
+    }
+
+    /// Одно Info-уведомление о пропущенных и не-UTF-8 файлах индекса.
+    /// У `Notice` нет отдельного поля под подробности, поэтому первые
+    /// несколько путей попадают в текст сообщения.
+    fn report_index_warnings(&mut self) {
+        let warnings = self.index.warnings();
+        if warnings.is_empty() {
+            return;
+        }
+        let details: Vec<&str> = warnings.iter().take(3).map(String::as_str).collect();
+        let mut text = format!("Пропущено файлов: {}", warnings.len());
+        text.push_str(&format!(": {}", details.join("; ")));
+        if warnings.len() > details.len() {
+            text.push_str(" …");
+        }
+        self.notices.info(text);
     }
 
     /// Читает файл заметки с диска. `Ok(None)` — файла нет.
@@ -259,9 +277,14 @@ impl VaultState {
                 self.last_edit = None;
                 self.open = Some(rel);
             }
-            Err(e) => self
-                .notices
-                .error(format!("Не удалось открыть {}: {e}", rel.display())),
+            Err(e) => {
+                let msg = if is_utf8_error(&e) {
+                    format!("Файл {} не в UTF-8, открытие отменено", rel.display())
+                } else {
+                    format!("Не удалось открыть {}: {e}", rel.display())
+                };
+                self.notices.error(msg);
+            }
         }
     }
 
@@ -808,6 +831,11 @@ impl VaultState {
             }
         }
     }
+}
+
+/// Файл не удалось прочитать как UTF-8 (например, он в CP1251).
+fn is_utf8_error(e: &VaultError) -> bool {
+    matches!(e, VaultError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData)
 }
 
 /// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),

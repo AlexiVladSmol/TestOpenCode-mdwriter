@@ -124,15 +124,30 @@ impl Vault {
     /// Скрытые файлы и папки (начинающиеся с `.`) пропускаются, кроме самого корня:
     /// vault может лежать в скрытой папке (`~/.notes`). Расширение сравнивается
     /// без учёта регистра (`.md`, `.MD`).
-    pub fn list_notes(&self) -> Result<Vec<PathBuf>> {
+    ///
+    /// Ошибкой считается только недоступность корня. Проблемы с отдельными
+    /// записями (нет прав, битая ссылка) пропускаются и возвращаются вторым
+    /// элементом как предупреждения.
+    pub fn list_notes(&self) -> Result<(Vec<PathBuf>, Vec<String>)> {
         let mut notes = Vec::new();
+        let mut warnings = Vec::new();
         let walker = walkdir::WalkDir::new(&self.root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !is_hidden(e));
 
         for entry in walker {
-            let entry = entry.map_err(std::io::Error::other)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    // Корень недоступен — работать не с чем.
+                    if e.depth() == 0 {
+                        return Err(std::io::Error::other(e).into());
+                    }
+                    warnings.push(format!("пропущено при обходе: {e}"));
+                    continue;
+                }
+            };
             if entry.file_type().is_file() {
                 let path = entry.path();
                 let is_md = path
@@ -145,11 +160,22 @@ impl Vault {
             }
         }
         notes.sort();
-        Ok(notes)
+        warnings.sort();
+        Ok((notes, warnings))
     }
 
     pub fn read(&self, rel: &Path) -> Result<String> {
         Ok(fs::read_to_string(self.checked_path(rel)?)?)
+    }
+
+    /// Читает файл, заменяя невалидные байты UTF-8 символом `�`.
+    /// Второй элемент — были ли такие байты (для предупреждений индекса).
+    pub fn read_lossy(&self, rel: &Path) -> Result<(String, bool)> {
+        let bytes = fs::read(self.checked_path(rel)?)?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok((text, false)),
+            Err(e) => Ok((String::from_utf8_lossy(e.as_bytes()).into_owned(), true)),
+        }
     }
 
     /// Атомарная запись: пишем во временный файл в той же папке, затем rename.
@@ -232,7 +258,8 @@ mod tests {
         // скрытая папка пропускается
         vault.create(Path::new(".hidden/d.md")).unwrap();
 
-        let notes = vault.list_notes().unwrap();
+        let (notes, warnings) = vault.list_notes().unwrap();
+        assert!(warnings.is_empty());
         assert_eq!(
             notes,
             vec![
@@ -274,7 +301,10 @@ mod tests {
         vault.create(Path::new("note.md")).unwrap();
         vault.create(Path::new(".secret/inner.md")).unwrap();
 
-        assert_eq!(vault.list_notes().unwrap(), vec![PathBuf::from("note.md")]);
+        assert_eq!(
+            vault.list_notes().unwrap().0,
+            vec![PathBuf::from("note.md")]
+        );
     }
 
     #[test]
@@ -284,7 +314,7 @@ mod tests {
         vault.create(Path::new("b.md")).unwrap();
 
         assert_eq!(
-            vault.list_notes().unwrap(),
+            vault.list_notes().unwrap().0,
             vec![PathBuf::from("A.MD"), PathBuf::from("b.md")]
         );
     }
@@ -356,5 +386,38 @@ mod tests {
         vault.write(Path::new("a/./b.md"), "ok").unwrap();
         assert_eq!(vault.read(Path::new("a/b.md")).unwrap(), "ok");
         assert!(dir.join("a").join("b.md").exists());
+    }
+
+    #[test]
+    fn read_lossy_marks_invalid_utf8() {
+        let (vault, dir) = temp_vault();
+        fs::write(dir.join("bad.md"), [0xC0u8, 0xC1]).unwrap();
+        let (text, lossy) = vault.read_lossy(Path::new("bad.md")).unwrap();
+        assert!(lossy, "невалидные байты должны быть отмечены");
+        assert!(!text.is_empty(), "текст читается с заменами");
+        // Строгое чтение по-прежнему падает.
+        assert!(vault.read(Path::new("bad.md")).is_err());
+
+        // Валидный файл — без пометки.
+        vault.write(Path::new("ok.md"), "текст").unwrap();
+        let (text, lossy) = vault.read_lossy(Path::new("ok.md")).unwrap();
+        assert_eq!(text, "текст");
+        assert!(!lossy);
+    }
+
+    #[test]
+    fn list_notes_reports_no_warnings_for_clean_vault() {
+        let (vault, _dir) = temp_vault();
+        vault.create(Path::new("a.md")).unwrap();
+        let (notes, warnings) = vault.list_notes().unwrap();
+        assert_eq!(notes, vec![PathBuf::from("a.md")]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_root_is_an_error() {
+        let dir = std::env::temp_dir().join("mdwriter-no-such-vault-dir");
+        let vault = Vault::open(dir);
+        assert!(vault.list_notes().is_err(), "недоступный корень — ошибка");
     }
 }
