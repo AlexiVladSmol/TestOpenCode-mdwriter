@@ -150,10 +150,6 @@ impl GraphView {
         self.graph.node_count()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.graph.node_count() == 0
-    }
-
     /// (заголовок, путь, позиция) узла по индексу.
     pub fn node(&self, i: usize) -> Option<(&str, &PathBuf, egui::Pos2)> {
         self.titles

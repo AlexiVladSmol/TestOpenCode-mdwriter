@@ -115,7 +115,7 @@
 | C3 | P2 | Инкрементальное обновление индекса | C1, B7 | Claude | 4 | [ ] |
 | C4 | P2 | Граф: остановка симуляции, перерисовка, ленивая сборка | C1 | DeepSeek | 4 | [ ] |
 | D2 | P2 | Общие опции парсера и wiki-преобразование в `markdown` | B1 | DeepSeek | 1 | [x] |
-| D3 | P3 | Убрать дубли в preview и двойную загрузку настроек | R1 | DeepSeek | 4 | [ ] |
+| D3 | P3 | Убрать дубли в preview и двойную загрузку настроек | R1 | DeepSeek | 4 | [x] |
 | D4 | P3 | Переименовать крейты в `mdwriter-*`, `publish = false` | — | DeepSeek | 4 | [x] |
 | E1 | P1 | CI: fmt + clippy + test на Windows и Linux | — | DeepSeek | 0 | [x] |
 | E2 | P2 | Указать `rust-version` | — | DeepSeek | 4 | [x] |
