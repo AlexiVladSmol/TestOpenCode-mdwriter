@@ -302,7 +302,8 @@ mod tests {
 
     #[test]
     fn wikilinks_skip_code() {
-        let text = "[[вне]]\n\n```\n[[внутри огряды]]\n```\n\n`[[в инлайн-коде]]` и [[снова вне]]\n";
+        let text =
+            "[[вне]]\n\n```\n[[внутри огряды]]\n```\n\n`[[в инлайн-коде]]` и [[снова вне]]\n";
         let links = extract_wikilinks(text);
         let targets: Vec<_> = links.iter().map(|w| w.target.as_str()).collect();
         assert_eq!(targets, vec!["вне", "снова вне"]);

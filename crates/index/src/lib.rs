@@ -149,7 +149,11 @@ impl Index {
                 .get(rel)
                 .map(|m| m.title.to_lowercase().contains(&q))
                 .unwrap_or(false);
-            if let Some(pos) = text.to_lowercase().find(&q).or_else(|| title_hit.then_some(0)) {
+            if let Some(pos) = text
+                .to_lowercase()
+                .find(&q)
+                .or_else(|| title_hit.then_some(0))
+            {
                 out.push((rel.clone(), snippet(text, pos, q.len())));
             }
         }
@@ -201,9 +205,7 @@ mod tests {
         vault
             .write(Path::new("a.md"), "Ссылка на [[b]] и [[c]]")
             .unwrap();
-        vault
-            .write(Path::new("b.md"), "Ссылка на [[c]]")
-            .unwrap();
+        vault.write(Path::new("b.md"), "Ссылка на [[c]]").unwrap();
         vault
             .write(Path::new("sub/c.md"), "---\ntitle: Си\n---\nОдинокая")
             .unwrap();
@@ -215,7 +217,10 @@ mod tests {
         let mut backlinks = index.backlinks(c);
         assert_eq!(backlinks.len(), 2);
         backlinks.sort();
-        assert_eq!(backlinks, vec![PathBuf::from("a.md"), PathBuf::from("b.md")]);
+        assert_eq!(
+            backlinks,
+            vec![PathBuf::from("a.md"), PathBuf::from("b.md")]
+        );
         assert_eq!(index.title(c), Some("Си"));
         assert!(index.backlinks(Path::new("a.md")).is_empty());
     }
@@ -251,7 +256,9 @@ mod tests {
             index.resolve_wikilink(Path::new("root.md"), "deep.md"),
             Some(PathBuf::from("sub/deep.md"))
         );
-        assert!(index.resolve_wikilink(Path::new("root.md"), "нет").is_none());
+        assert!(index
+            .resolve_wikilink(Path::new("root.md"), "нет")
+            .is_none());
     }
 
     #[test]
@@ -260,9 +267,7 @@ mod tests {
         vault
             .write(Path::new("one.md"), "Просто текст про пони")
             .unwrap();
-        vault
-            .write(Path::new("two.md"), "Совсем другое")
-            .unwrap();
+        vault.write(Path::new("two.md"), "Совсем другое").unwrap();
 
         let index = Index::build(&vault).unwrap();
         let hits = index.search("пони", 10);

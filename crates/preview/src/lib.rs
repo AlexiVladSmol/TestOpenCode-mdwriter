@@ -9,7 +9,9 @@ use std::iter::Peekable;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Margin, RichText, Stroke, TextStyle, Ui};
-use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 
 /// Действие, которое пользователь запросил в предпросмотре.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,14 +415,7 @@ fn render_item(
             }
             Some(Event::Start(_)) => {
                 ui.indent("nested", |ui| {
-                    render_block_once(
-                        ui,
-                        events,
-                        task_lines,
-                        task_counter,
-                        block_counter,
-                        actions,
-                    )
+                    render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
                 });
             }
             Some(_) => {
@@ -506,14 +501,7 @@ fn render_quote_content(
                 break;
             }
             Some(Event::Start(_)) => {
-                render_block_once(
-                    ui,
-                    events,
-                    task_lines,
-                    task_counter,
-                    block_counter,
-                    actions,
-                )
+                render_block_once(ui, events, task_lines, task_counter, block_counter, actions)
             }
             Some(_) => {
                 events.next();
@@ -532,10 +520,8 @@ fn render_math_block(ui: &mut Ui, formula: &str) {
         .show(ui, |ui| {
             ui.centered_and_justified(|ui| {
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(formula).monospace().italics().color(color),
-                    )
-                    .selectable(false),
+                    egui::Label::new(RichText::new(formula).monospace().italics().color(color))
+                        .selectable(false),
                 );
             });
         });
@@ -590,11 +576,7 @@ fn render_codeblock(
         });
 }
 
-fn render_table(
-    ui: &mut Ui,
-    events: &mut Peekable<Parser<'_>>,
-    block_counter: &mut usize,
-) {
+fn render_table(ui: &mut Ui, events: &mut Peekable<Parser<'_>>, block_counter: &mut usize) {
     let block_n = *block_counter;
     *block_counter += 1;
     // Собираем строки: (заголовок?, ячейки)
@@ -642,23 +624,23 @@ fn render_table(
             egui::ScrollArea::horizontal()
                 .id_salt(("md_table", block_n))
                 .show(ui, |ui| {
-                egui::Grid::new("md_table")
-                    .striped(true)
-                    .min_col_width(60.0)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        for (is_head, cells) in &rows {
-                            for cell in cells {
-                                if *is_head {
-                                    ui.strong(cell);
-                                } else {
-                                    ui.label(cell);
+                    egui::Grid::new("md_table")
+                        .striped(true)
+                        .min_col_width(60.0)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for (is_head, cells) in &rows {
+                                for cell in cells {
+                                    if *is_head {
+                                        ui.strong(cell);
+                                    } else {
+                                        ui.label(cell);
+                                    }
                                 }
+                                ui.end_row();
                             }
-                            ui.end_row();
-                        }
-                    });
-            });
+                        });
+                });
         });
 }
 
@@ -690,13 +672,15 @@ struct LinkRange {
 fn is_block_start(ev: &Event<'_>) -> bool {
     matches!(
         ev,
-        Event::Start(Tag::List(_)
-            | Tag::BlockQuote(_)
-            | Tag::CodeBlock(_)
-            | Tag::Table(_)
-            | Tag::Heading { .. }
-            | Tag::FootnoteDefinition(_)
-            | Tag::HtmlBlock)
+        Event::Start(
+            Tag::List(_)
+                | Tag::BlockQuote(_)
+                | Tag::CodeBlock(_)
+                | Tag::Table(_)
+                | Tag::Heading { .. }
+                | Tag::FootnoteDefinition(_)
+                | Tag::HtmlBlock
+        )
     )
 }
 
@@ -766,12 +750,7 @@ fn render_inline_with(
 }
 
 /// Рисует LayoutJob и обрабатывает клики по wikilinks внутри него.
-fn render_job(
-    ui: &mut Ui,
-    job: LayoutJob,
-    links: &[LinkRange],
-    actions: &mut Vec<Action>,
-) {
+fn render_job(ui: &mut Ui, job: LayoutJob, links: &[LinkRange], actions: &mut Vec<Action>) {
     let response = ui.label(job.clone());
     if !links.is_empty() && response.clicked() {
         let galley = ui.fonts_mut(|f| f.layout_job(job));
@@ -1026,7 +1005,8 @@ mod tests {
 
     #[test]
     fn collect_task_lines_basic() {
-        let body = "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
+        let body =
+            "- [ ] один\n1. [x] два\n  * [ ] вложенная\nпросто строка\n```\n- [ ] в коде\n```\n";
         let lines = collect_task_lines(body);
         assert_eq!(lines, vec![0, 1, 2]);
     }

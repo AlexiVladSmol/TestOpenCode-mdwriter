@@ -90,7 +90,7 @@
 | D2 | P2 | Общие опции парсера и wiki-преобразование в `markdown` | B1 | DeepSeek | 1 | [ ] |
 | D3 | P3 | Убрать дубли в preview и двойную загрузку настроек | R1 | DeepSeek | 4 | [ ] |
 | D4 | P3 | Переименовать крейты в `mdwriter-*`, `publish = false` | — | DeepSeek | 4 | [ ] |
-| E1 | P1 | CI: fmt + clippy + test на Windows и Linux | — | DeepSeek | 0 | [ ] |
+| E1 | P1 | CI: fmt + clippy + test на Windows и Linux | — | DeepSeek | 0 | [x] |
 | E2 | P2 | Указать `rust-version` | — | DeepSeek | 4 | [ ] |
 | E3 | P3 | Почистить `.gitignore` | — | DeepSeek | 0 | [ ] |
 | E4 | P2 | Актуализировать `PLAN.md` и README | после фаз A–C | DeepSeek | 5 | [ ] |
