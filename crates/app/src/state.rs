@@ -10,7 +10,7 @@ use graph::GraphView;
 use index::Index;
 use vault::{Vault, VaultError, VaultWatcher};
 
-use crate::format::lines_range;
+use crate::format::{self, lines_range};
 use crate::notice::Notices;
 use crate::sync::{self, Reconcile};
 use crate::tree;
@@ -579,19 +579,25 @@ impl VaultState {
         let start = self.char_to_byte(range.start);
         let end = self.char_to_byte(range.end);
         let sel = self.editor_text[start..end].to_string();
+        let (new, cursor_in_new) = format::wrap_selection_text(&sel, before, after);
+        self.editor_text.replace_range(start..end, &new);
+        let cursor = self.editor_text[..start].chars().count() + cursor_in_new;
+        self.set_cursor(ctx, cursor);
+        self.dirty = true;
+        self.last_edit = None;
+    }
 
-        if !sel.is_empty() && sel.starts_with(before) && sel.ends_with(after) {
-            // Снять форматирование.
-            let inner = &sel[before.len()..sel.len() - after.len()];
-            self.editor_text.replace_range(start..end, inner);
-            let cursor = self.editor_text[..start].chars().count() + inner.chars().count();
-            self.set_cursor(ctx, cursor);
-        } else {
-            let new = format!("{before}{sel}{after}");
-            self.editor_text.replace_range(start..end, &new);
-            let cursor = self.editor_text[..start].chars().count() + new.chars().count();
-            self.set_cursor(ctx, cursor);
-        }
+    /// Кнопка «—»: вставляет `---` отдельной строкой после строки с концом
+    /// выделения. Выделенный текст не меняется.
+    pub(crate) fn insert_horizontal_rule(&mut self, ctx: &egui::Context) {
+        let Some(range) = self.selected_char_range(ctx) else {
+            return;
+        };
+        let end = self.char_to_byte(range.end);
+        let (new, cursor_byte) = format::insert_horizontal_rule(&self.editor_text, end);
+        let cursor = new[..cursor_byte].chars().count();
+        self.editor_text = new;
+        self.set_cursor(ctx, cursor);
         self.dirty = true;
         self.last_edit = None;
     }
@@ -847,6 +853,19 @@ pub(crate) fn line_count(text: &str) -> usize {
     text.split('\n').count()
 }
 
+const SEARCH_ID_SRC: &str = "mdwriter_search";
+
+/// Id поля поиска: по нему проверяется фокус и адресуется TextEdit.
+pub(crate) fn search_id() -> egui::Id {
+    egui::Id::unique(SEARCH_ID_SRC)
+}
+
+/// Esc очищает поиск только когда фокус в самом поле поиска (не в редакторе
+/// и не при открытом Quick Open) и запрос не пуст.
+pub(crate) fn should_clear_search(esc: bool, search_focused: bool, query_empty: bool) -> bool {
+    esc && search_focused && !query_empty
+}
+
 /// Путь новой заметки по цели wikilink: берётся только `path` (без якоря),
 /// `None` — если путь пустой (`[[#Заголовок]]`), создавать нечего.
 pub(crate) fn new_note_path(from: &Path, raw: &str) -> Option<PathBuf> {
@@ -945,6 +964,18 @@ mod tests {
         assert_eq!(new_note_path(from, "a.MD"), Some(PathBuf::from("sub/a.MD")));
         // Только якорь — создавать нечего.
         assert_eq!(new_note_path(from, "#Только якорь"), None);
+    }
+
+    // --------- B11: Esc очищает поиск только из поля поиска ---------
+
+    #[test]
+    fn esc_clears_search_only_when_the_field_has_focus() {
+        assert!(should_clear_search(true, true, false));
+        // Фокус в редакторе — Esc не трогает поиск.
+        assert!(!should_clear_search(true, false, false));
+        assert!(!should_clear_search(false, true, false));
+        // Пустой запрос очищать нечего.
+        assert!(!should_clear_search(true, true, true));
     }
 
     // --------- B10: количество строк для gutter ---------
