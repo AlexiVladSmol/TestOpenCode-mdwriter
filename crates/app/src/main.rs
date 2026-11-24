@@ -50,6 +50,15 @@ struct App {
     settings_dirty: bool,
     /// Уведомления пользователю (общая очередь, клон есть у `VaultState`).
     notices: Notices,
+    /// Контекст egui: через него наблюдатель за файлами будит окно.
+    ctx: egui::Context,
+}
+
+/// Колбэк для наблюдателя: из фонового потока просит перерисовать окно,
+/// чтобы внешние изменения были видны без движения мыши.
+fn repaint_on_change(ctx: &egui::Context) -> impl Fn() + Send + 'static {
+    let ctx = ctx.clone();
+    move || ctx.request_repaint()
 }
 
 impl App {
@@ -75,12 +84,13 @@ impl App {
             settings,
             settings_dirty: false,
             notices: Notices::default(),
+            ctx: cc.egui_ctx.clone(),
         };
 
         // Восстанавливаем последний vault.
         if let Some(path) = app.settings.last_vault.clone() {
             if path.is_dir() {
-                match VaultWatcher::new(&path) {
+                match VaultWatcher::new(&path, repaint_on_change(&app.ctx)) {
                     Ok(watcher) => {
                         let mut vs =
                             VaultState::open(Vault::open(path), watcher, app.notices.clone());
@@ -116,7 +126,7 @@ impl App {
                     return;
                 }
             }
-            match VaultWatcher::new(&path) {
+            match VaultWatcher::new(&path, repaint_on_change(&self.ctx)) {
                 Ok(watcher) => {
                     let mut vs =
                         VaultState::open(Vault::open(path.clone()), watcher, self.notices.clone());
@@ -205,9 +215,7 @@ impl eframe::App for App {
         let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
 
         if let Some(vs) = self.vault.as_mut() {
-            if vs.watcher.has_changes() {
-                vs.rescan();
-            }
+            vs.poll_watcher(now, ui.ctx());
             vs.maybe_autosave(now, ui.ctx());
             if ctrl_s {
                 // Ошибка уже показана уведомлением; правки остаются несохранёнными.

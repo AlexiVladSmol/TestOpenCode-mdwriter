@@ -17,6 +17,28 @@ use crate::tree;
 
 pub(crate) const AUTOSAVE_DELAY: f64 = 1.0;
 
+/// Через сколько секунд после первого события наблюдателя пересканировать
+/// vault: одно сохранение даёт серию событий (временный файл, rename…),
+/// и все они схлопываются в одно пересканирование.
+const RESCAN_DELAY: f64 = 0.3;
+
+/// Планировщик пересканирования. `pending` — запланированное время,
+/// `changed` — пришли ли новые события. Возвращает новое запланированное
+/// время и пора ли пересканировать сейчас. Отсчёт идёт от первого события,
+/// поэтому непрерывный поток изменений не откладывает пересканирование
+/// бесконечно.
+fn rescan_schedule(pending: Option<f64>, changed: bool, now: f64) -> (Option<f64>, bool) {
+    let pending = match pending {
+        Some(t) => Some(t),
+        None if changed => Some(now + RESCAN_DELAY),
+        None => None,
+    };
+    match pending {
+        Some(t) if now >= t => (None, true),
+        p => (p, false),
+    }
+}
+
 /// Фиксированный id редактора — для доступа к состоянию TextEdit (курсор/выделение).
 const EDITOR_ID_SRC: &str = "mdwriter_editor";
 
@@ -76,6 +98,8 @@ pub(crate) struct VaultState {
     pub(crate) conflict: bool,
     /// Файл удалён/переименован извне, а в редакторе есть несохранённые правки.
     pub(crate) orphaned: bool,
+    /// Когда пересканировать vault после событий наблюдателя (см. `poll_watcher`).
+    pub(crate) pending_rescan_at: Option<f64>,
     pub(crate) last_edit: Option<f64>,
     pub(crate) new_note_name: String,
     pub(crate) view_mode: ViewMode,
@@ -105,6 +129,7 @@ impl VaultState {
             disk_text: None,
             conflict: false,
             orphaned: false,
+            pending_rescan_at: None,
             last_edit: None,
             new_note_name: String::new(),
             view_mode: ViewMode::Split,
@@ -409,6 +434,20 @@ impl VaultState {
             // Запись не удалась (или flush сам обнаружил конфликт) — копия.
             Err(e) if self.dirty => self.save_copy().map(|_| ()).map_err(|_| e),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Забирает события наблюдателя за файлами и пересканирует vault через
+    /// `RESCAN_DELAY` после первого из них. Вызывать раз в кадр.
+    pub(crate) fn poll_watcher(&mut self, now: f64, ctx: &egui::Context) {
+        let changed = !self.watcher.take_changes().is_empty();
+        let (pending, due) = rescan_schedule(self.pending_rescan_at, changed, now);
+        self.pending_rescan_at = pending;
+        if due {
+            self.rescan();
+        } else if let Some(t) = pending {
+            // Кадр нужен к назначенному времени, даже если пользователь бездействует.
+            ctx.request_repaint_after(Duration::from_secs_f64((t - now).max(0.0)));
         }
     }
 
@@ -867,7 +906,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.md"), "исходный").unwrap();
-        let watcher = VaultWatcher::new(&dir).unwrap();
+        let watcher = VaultWatcher::new(&dir, || {}).unwrap();
         let mut vs = VaultState::open(Vault::open(dir.clone()), watcher, Notices::default());
         vs.load(PathBuf::from("a.md"));
         assert_eq!(vs.editor_text, "исходный");
@@ -1025,5 +1064,44 @@ mod tests {
         vs.load(PathBuf::from("b.md"));
         assert_eq!(vs.open.as_deref(), Some(Path::new("a.md")));
         assert_eq!(vs.editor_text, "мои");
+    }
+
+    // ------------------- B7: наблюдатель и пересканирование -------------------
+
+    #[test]
+    fn b7_schedule_waits_from_first_event() {
+        // Ничего не пришло — ничего не планируем.
+        assert_eq!(rescan_schedule(None, false, 1.0), (None, false));
+        // Первое событие — пересканирование через RESCAN_DELAY.
+        let (p, due) = rescan_schedule(None, true, 1.0);
+        assert_eq!((p, due), (Some(1.0 + RESCAN_DELAY), false));
+        // Новые события не откладывают уже назначенное время.
+        assert_eq!(rescan_schedule(p, true, 1.2), (p, false));
+        // Время пришло — пересканировать и сбросить план.
+        assert_eq!(rescan_schedule(p, false, 1.0 + RESCAN_DELAY), (None, true));
+    }
+
+    #[test]
+    fn b7_external_change_reaches_editor_through_watcher() {
+        use std::time::{Duration, Instant};
+
+        let (mut vs, dir) = open_a();
+        let ctx = egui::Context::default();
+        std::fs::write(dir.join("a.md"), "извне").unwrap();
+
+        // Ждём, пока событие дойдёт и пересканирование будет запланировано.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vs.pending_rescan_at.is_none() && Instant::now() < deadline {
+            vs.poll_watcher(0.0, &ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(vs.pending_rescan_at, Some(RESCAN_DELAY));
+        // До срока ничего не меняется.
+        vs.poll_watcher(RESCAN_DELAY / 2.0, &ctx);
+        assert_eq!(vs.editor_text, "исходный");
+        // В срок — пересканирование, A3 перезагружает чистую заметку.
+        vs.poll_watcher(RESCAN_DELAY, &ctx);
+        assert_eq!(vs.pending_rescan_at, None);
+        assert_eq!(vs.editor_text, "извне");
     }
 }
