@@ -1,9 +1,67 @@
 //! Работа с файлами vault: обход, чтение, атомарная запись, создание.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use thiserror::Error;
+
+/// Счётчик для уникальных имён временных файлов в пределах процесса.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Сколько раз повторять `rename` при `PermissionDenied` (Windows).
+const RENAME_RETRIES: usize = 3;
+
+/// Пауза между повторами `rename`.
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Атомарная запись файла: данные пишутся во временный файл рядом с целевым,
+/// сбрасываются на диск (`sync_all`) и только потом заменяют цель через `rename`.
+///
+/// Так читатель видит либо старое, либо новое содержимое целиком, а сбой питания
+/// не оставляет пустой файл. Временный файл начинается с точки, поэтому не
+/// попадает в [`Vault::list_notes`] и в наблюдатель vault.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    match write_synced(&tmp, bytes).and_then(|()| rename_with_retry(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Не оставляем мусор после неудачной записи.
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_synced(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    Ok(())
+}
+
+/// `fs::rename` с повторами: на Windows файл может быть кратковременно занят
+/// антивирусом или синхронизатором.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if cfg!(windows)
+                    && e.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < RENAME_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(RENAME_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -77,23 +135,27 @@ impl Vault {
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = temp_path(&abs);
-        fs::write(&tmp, content)?;
-        fs::rename(&tmp, &abs)?;
+        atomic_write(&abs, content.as_bytes())?;
         Ok(())
     }
 
     /// Создать новый (пустой) файл заметки, создавая родительские папки.
-    /// Если файл уже существует — ничего не делает.
+    /// Если файл уже существует — ничего не делает (содержимое не трогается).
     pub fn create(&self, rel: &Path) -> Result<()> {
         let abs = self.abs_path(rel);
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
-        if !abs.exists() {
-            fs::write(&abs, "")?;
+        // `create_new` — атомарная проверка «файла ещё нет» без гонки с `exists()`.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 }
 
@@ -105,13 +167,15 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
         .unwrap_or(false)
 }
 
+/// Имя временного файла: `.{имя}.{pid}.{счётчик}.tmp` в той же папке.
+/// Точка в начале скрывает файл от обхода vault и наблюдателя.
 fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path
+    let name = path
         .file_name()
-        .map(|s| s.to_os_string())
+        .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    name.push(".tmp");
-    path.with_file_name(name)
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -200,5 +264,44 @@ mod tests {
             vault.list_notes().unwrap(),
             vec![PathBuf::from("A.MD"), PathBuf::from("b.md")]
         );
+    }
+
+    /// Все файлы `*.tmp` в папке (рекурсивно).
+    fn temp_leftovers(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".tmp")
+            {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn double_write_keeps_last_content_and_leaves_no_tmp() {
+        let (vault, dir) = temp_vault();
+        vault.write(Path::new("note.md"), "первая версия").unwrap();
+        vault.write(Path::new("note.md"), "вторая версия").unwrap();
+
+        assert_eq!(vault.read(Path::new("note.md")).unwrap(), "вторая версия");
+        assert!(temp_leftovers(&dir).is_empty());
+    }
+
+    #[test]
+    fn create_does_not_overwrite_existing_note() {
+        let (vault, _dir) = temp_vault();
+        vault.create(Path::new("note.md")).unwrap();
+        vault.write(Path::new("note.md"), "важное").unwrap();
+        // Повторное создание не должно затирать содержимое.
+        vault.create(Path::new("note.md")).unwrap();
+
+        assert_eq!(vault.read(Path::new("note.md")).unwrap(), "важное");
     }
 }
