@@ -134,51 +134,19 @@ fn render_blocks(
     actions: &mut Vec<Action>,
 ) {
     while let Some(ev) = events.peek().cloned() {
+        // Блочные элементы рисует `render_block_once` — тот же код, что и для
+        // вложенного содержимого списков и цитат (раньше здесь был дубль).
+        if render_block_once(
+            ui,
+            events,
+            task_offsets,
+            task_counter,
+            block_counter,
+            actions,
+        ) {
+            continue;
+        }
         match ev {
-            Event::Start(Tag::Paragraph) => {
-                events.next();
-                render_inline(ui, events, InlineStop::Paragraph, actions);
-            }
-            Event::Start(Tag::Heading { level, .. }) => {
-                events.next();
-                render_heading(ui, events, level, actions);
-            }
-            Event::Start(Tag::List(start)) => {
-                events.next();
-                render_list(
-                    ui,
-                    events,
-                    start,
-                    task_offsets,
-                    task_counter,
-                    block_counter,
-                    actions,
-                );
-            }
-            Event::Start(Tag::BlockQuote(kind)) => {
-                events.next();
-                render_blockquote(
-                    ui,
-                    events,
-                    kind,
-                    task_offsets,
-                    task_counter,
-                    block_counter,
-                    actions,
-                );
-            }
-            Event::Start(Tag::CodeBlock(kind)) => {
-                events.next();
-                render_codeblock(ui, events, &kind, block_counter);
-            }
-            Event::Start(Tag::Table(_)) => {
-                events.next();
-                render_table(ui, events, block_counter);
-            }
-            Event::DisplayMath(m) => {
-                events.next();
-                render_math_block(ui, &m);
-            }
             Event::Start(Tag::FootnoteDefinition(_)) => {
                 events.next();
                 ui.indent("footnote", |ui| {
@@ -210,7 +178,8 @@ fn render_blocks(
     }
 }
 
-/// Рендер одного блока (для вложенного контента: внутри пунктов списков и цитат).
+/// Рендер одного блока. `true` — событие было блоком и обработано,
+/// `false` — событие не блочное (его разбирает вызывающий).
 fn render_block_once(
     ui: &mut Ui,
     events: &mut Peekable<Parser<'_>>,
@@ -218,15 +187,17 @@ fn render_block_once(
     task_counter: &mut usize,
     block_counter: &mut usize,
     actions: &mut Vec<Action>,
-) {
+) -> bool {
     match events.peek().cloned() {
         Some(Event::Start(Tag::Paragraph)) => {
             events.next();
             render_inline(ui, events, InlineStop::Paragraph, actions);
+            true
         }
         Some(Event::Start(Tag::Heading { level, .. })) => {
             events.next();
             render_heading(ui, events, level, actions);
+            true
         }
         Some(Event::Start(Tag::List(start))) => {
             events.next();
@@ -239,6 +210,7 @@ fn render_block_once(
                 block_counter,
                 actions,
             );
+            true
         }
         Some(Event::Start(Tag::BlockQuote(kind))) => {
             events.next();
@@ -251,20 +223,24 @@ fn render_block_once(
                 block_counter,
                 actions,
             );
+            true
         }
         Some(Event::Start(Tag::CodeBlock(kind))) => {
             events.next();
             render_codeblock(ui, events, &kind, block_counter);
+            true
         }
         Some(Event::Start(Tag::Table(_))) => {
             events.next();
             render_table(ui, events, block_counter);
+            true
         }
         Some(Event::DisplayMath(m)) => {
             events.next();
             render_math_block(ui, &m);
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -477,21 +453,24 @@ fn render_quote_content(
     actions: &mut Vec<Action>,
 ) {
     loop {
-        match events.peek() {
+        match events.peek().cloned() {
             Some(Event::End(TagEnd::BlockQuote(_))) => {
                 events.next();
                 break;
             }
-            Some(Event::Start(_)) => render_block_once(
-                ui,
-                events,
-                task_offsets,
-                task_counter,
-                block_counter,
-                actions,
-            ),
             Some(_) => {
-                events.next();
+                let handled = render_block_once(
+                    ui,
+                    events,
+                    task_offsets,
+                    task_counter,
+                    block_counter,
+                    actions,
+                );
+                // Неизвестное событие пропускаем, иначе цикл встанет на нём.
+                if !handled {
+                    events.next();
+                }
             }
             None => break,
         }
@@ -1097,6 +1076,45 @@ mod tests {
         assert!(link_at(&links, 6).is_some());
         // Символ сразу после ссылки уже не кликабелен.
         assert!(link_at(&links, 7).is_none());
+    }
+
+    /// D3: блоки рендерятся одним кодом (`render_block_once`) и для верхнего
+    /// уровня, и для вложенного содержимого. Прогоняем документ со всеми
+    /// блоками, включая цитату со списком и кодом, — паника или зацикливание
+    /// здесь означали бы регрессию рефакторинга.
+    #[test]
+    fn nested_blocks_render_without_panicking() {
+        let text = "\
+# Заголовок
+
+Абзац с *курсивом* и [[ссылкой]].
+
+> Цитата
+> - пункт списка
+> - второй пункт
+>
+> ```rust
+> fn main() {}
+> ```
+
+| a | b |
+|---|---|
+| 1 | 2 |
+
+- [ ] задача
+- [x] сделано
+
+---
+
+Текст после правила.
+";
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let actions = markdown(ui, text);
+            assert!(actions.is_empty(), "в документе нет кликабельных действий");
+        });
+        // В тестах нет рендерера: дельты текстур нужно «принять».
+        output.textures_delta.clear();
     }
 
     #[test]
