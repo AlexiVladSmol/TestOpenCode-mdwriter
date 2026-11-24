@@ -2,19 +2,21 @@
 name = "mdwriter"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 chrono.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
-graph = { path = "../graph" }
-index = { path = "../index" }
-markdown = { path = "../markdown" }
-preview = { path = "../preview" }
+graph = { package = "mdwriter-graph", path = "../graph" }
+index = { package = "mdwriter-index", path = "../index" }
+markdown = { package = "mdwriter-markdown", path = "../markdown" }
+preview = { package = "mdwriter-preview", path = "../preview" }
 pulldown-cmark.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-vault = { path = "../vault" }
+vault = { package = "mdwriter-vault", path = "../vault" }

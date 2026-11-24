@@ -40,7 +40,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "mdwriter",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        // Настройки читаем один раз и передаём в приложение: раньше `App::new`
+        // загружал их заново, и файл читался дважды за запуск.
+        Box::new(move |cc| Ok(Box::new(App::new(cc, settings)))),
     )
 }
 
@@ -64,7 +66,7 @@ fn repaint_on_change(ctx: &egui::Context) -> impl Fn() + Send + 'static {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, settings: Settings) -> Self {
         // Регистрируем жирный системный шрифт (если найден).
         if let Some(bold) = fonts::load_bold_font() {
             let mut fonts = egui::FontDefinitions::default();
@@ -78,7 +80,6 @@ impl App {
             cc.egui_ctx.set_fonts(fonts);
         }
 
-        let settings = settings::load_settings();
         theme::apply_theme(&cc.egui_ctx, settings.theme);
 
         let mut app = App {
