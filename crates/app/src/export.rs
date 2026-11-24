@@ -86,7 +86,9 @@ impl App {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{stem}.html"));
         let html = render_html(&title, &text);
-        match std::fs::write(&path, html) {
+        // Атомарная запись (A4), как для заметок: обрыв посреди записи не
+        // оставит пользователя с половиной HTML-файла.
+        match vault::store::atomic_write(&path, html.as_bytes()) {
             Ok(()) => self
                 .notices
                 .info(format!("Экспортировано: {}", path.display())),

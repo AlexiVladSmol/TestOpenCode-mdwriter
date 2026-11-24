@@ -50,6 +50,8 @@ pub(crate) struct Picker {
     name_input: String,
     show_hidden: bool,
     error: Option<String>,
+    /// Путь, который уже существует и ждёт подтверждения замены.
+    confirm: Option<PathBuf>,
 }
 
 impl Picker {
@@ -73,6 +75,7 @@ impl Picker {
             name_input: file_name,
             show_hidden: false,
             error: None,
+            confirm: None,
         };
         picker.goto(start);
         picker
@@ -88,6 +91,8 @@ impl Picker {
                 self.dirs = dirs;
                 self.selected = None;
                 self.error = None;
+                // Другая папка — вопрос о замене относится к прежнему пути.
+                self.confirm = None;
             }
             Err(e) => {
                 self.error = Some(format!("Не удалось открыть {}: {e}", dir.display()));
@@ -109,6 +114,10 @@ impl Picker {
     }
 
     /// Итоговый путь файла в режиме [`Mode::Save`].
+    ///
+    /// Экспорт — только HTML: `.html`/`.htm`. Имя без расширения получает
+    /// `.html`; любое другое расширение (`заметка.md`) — ошибка, иначе файл
+    /// молча записался бы не в том формате.
     fn save_path(&self) -> Result<PathBuf, String> {
         let name = self.name_input.trim();
         if name.is_empty() {
@@ -118,8 +127,32 @@ impl Picker {
             return Err("Имя файла не должно содержать слэши".to_string());
         }
         let name = with_html_extension(name);
+        if !has_html_extension(&name) {
+            return Err("Экспорт возможен только в файл .html или .htm".to_string());
+        }
         Ok(self.current.join(name))
     }
+
+    /// Что делать по кнопке «Сохранить сюда»: писать сразу, спросить о замене
+    /// существующего файла или показать ошибку в модалке.
+    fn save_step(&self) -> SaveStep {
+        match self.save_path() {
+            Ok(path) if path.exists() => SaveStep::Confirm(path),
+            Ok(path) => SaveStep::Save(path),
+            Err(message) => SaveStep::Reject(message),
+        }
+    }
+}
+
+/// Решение по кнопке сохранения в режиме [`Mode::Save`].
+#[derive(Debug, PartialEq, Eq)]
+enum SaveStep {
+    /// Файла нет — можно писать.
+    Save(PathBuf),
+    /// Файл уже есть — нужен явный ответ «Заменить».
+    Confirm(PathBuf),
+    /// Имя или расширение не подходят.
+    Reject(String),
 }
 
 /// Рисует модалку и возвращает результат, если пользователь что-то выбрал.
@@ -196,12 +229,32 @@ pub(crate) fn show(ui: &mut egui::Ui, picker: &mut Picker) -> Option<Action> {
             if picker.mode == Mode::Save {
                 ui.horizontal(|ui| {
                     ui.label("Имя файла:");
-                    ui.add(
+                    let response = ui.add(
                         egui::TextEdit::singleline(&mut picker.name_input)
                             .desired_width(260.0)
                             .id_salt("folder_picker_name"),
                     );
+                    // Другое имя — вопрос о замене уже не актуален.
+                    if response.changed() {
+                        picker.confirm = None;
+                    }
                 });
+                if let Some(path) = picker.confirm.clone() {
+                    let color = ui.visuals().warn_fg_color;
+                    ui.colored_label(
+                        color,
+                        format!("Файл «{}» уже существует. Заменить?", path.display()),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Заменить").clicked() {
+                            picker.confirm = None;
+                            action = Some(Action::Saved(path.clone()));
+                        }
+                        if ui.button("Отмена").clicked() {
+                            picker.confirm = None;
+                        }
+                    });
+                }
             }
 
             ui.horizontal(|ui| {
@@ -222,10 +275,12 @@ pub(crate) fn show(ui: &mut egui::Ui, picker: &mut Picker) -> Option<Action> {
                     if ui.button(confirm).clicked() {
                         match picker.mode {
                             Mode::Open => action = Some(Action::Opened(picker.current.clone())),
-                            Mode::Save => match picker.save_path() {
-                                Ok(path) => action = Some(Action::Saved(path)),
+                            Mode::Save => match picker.save_step() {
+                                SaveStep::Save(path) => action = Some(Action::Saved(path)),
+                                // Молча не перезаписываем: спрашиваем в модалке.
+                                SaveStep::Confirm(path) => picker.confirm = Some(path),
                                 // Ошибку ввода показываем в модалке, не закрывая её.
-                                Err(message) => picker.error = Some(message),
+                                SaveStep::Reject(message) => picker.error = Some(message),
                             },
                         }
                     }
@@ -321,6 +376,14 @@ fn resolve_input(input: &str, base: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// Расширение `.html`/`.htm` (без учёта регистра).
+fn has_html_extension(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
 }
 
 /// Дописывает `.html`, если у имени нет расширения.
@@ -423,6 +486,59 @@ mod tests {
         assert_eq!(with_html_extension("note.html"), "note.html");
         assert_eq!(with_html_extension("note.HTML"), "note.HTML");
         assert_eq!(with_html_extension("my.note"), "my.note");
+    }
+
+    #[test]
+    fn has_html_extension_accepts_only_html_and_htm() {
+        assert!(has_html_extension("note.html"));
+        assert!(has_html_extension("note.HTML"));
+        assert!(has_html_extension("note.htm"));
+        assert!(!has_html_extension("note.md"));
+        assert!(!has_html_extension("note.htm.txt"));
+        assert!(!has_html_extension("note"));
+    }
+
+    /// G6a: экспорт — только в `.html`/`.htm`, иначе файл записался бы
+    /// в формате, которого пользователь не ждал (`заметка.md` с HTML внутри).
+    #[test]
+    fn save_path_accepts_only_html_extensions() {
+        let tmp = TempDir::new("save-ext");
+        let mut picker = Picker::export_html(tmp.path().to_path_buf(), String::new());
+
+        picker.name_input = "заметка.md".to_string();
+        let message = picker.save_path().unwrap_err();
+        assert!(message.contains(".html"), "{message}");
+
+        picker.name_input = "note.htm".to_string();
+        assert_eq!(picker.save_path().unwrap(), tmp.path().join("note.htm"));
+
+        picker.name_input = "note.HTML".to_string();
+        assert_eq!(picker.save_path().unwrap(), tmp.path().join("note.HTML"));
+
+        picker.name_input = "note".to_string();
+        assert_eq!(picker.save_path().unwrap(), tmp.path().join("note.html"));
+    }
+
+    /// G6a: существующий файл не перезаписывается без явного подтверждения.
+    #[test]
+    fn save_step_asks_before_overwriting() {
+        let tmp = TempDir::new("save-exists");
+        std::fs::write(tmp.path().join("note.html"), "старый").unwrap();
+        let mut picker = Picker::export_html(tmp.path().to_path_buf(), "note.html".to_string());
+
+        let expected = tmp.path().join("note.html");
+        assert_eq!(picker.save_step(), SaveStep::Confirm(expected.clone()));
+
+        // Новое имя — писать можно без вопросов.
+        picker.name_input = "fresh.html".to_string();
+        assert_eq!(
+            picker.save_step(),
+            SaveStep::Save(tmp.path().join("fresh.html"))
+        );
+
+        // Ошибка ввода — не решение о записи.
+        picker.name_input = "note.md".to_string();
+        assert!(matches!(picker.save_step(), SaveStep::Reject(_)));
     }
 
     #[test]
