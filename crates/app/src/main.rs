@@ -744,7 +744,7 @@ impl App {
             self.settings.window_size = Some(size);
         }
 
-        if self.settings_dirty {
+        if should_save_settings(self.settings_dirty, ctx.input(|i| i.pointer.any_down())) {
             self.save_settings();
         }
     }
@@ -756,7 +756,8 @@ impl App {
         }
         match serde_json::to_string_pretty(&self.settings) {
             Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
+                // Атомарная запись: оборванная запись не оставит битый JSON.
+                if let Err(e) = vault::store::atomic_write(&path, s.as_bytes()) {
                     eprintln!("settings save failed: {e}");
                 }
             }
@@ -764,6 +765,12 @@ impl App {
         }
         self.settings_dirty = false;
     }
+}
+
+/// Нужно ли писать настройки в этом кадре: только при изменениях и не во время
+/// перетаскивания (иначе разделитель панели пишет файл в каждом кадре).
+fn should_save_settings(settings_dirty: bool, pointer_down: bool) -> bool {
+    settings_dirty && !pointer_down
 }
 
 impl App {
@@ -1506,6 +1513,15 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_saved_only_when_dirty_and_not_dragging() {
+        assert!(should_save_settings(true, false));
+        // Пока зажата кнопка мыши (перетаскивание разделителя) не пишем.
+        assert!(!should_save_settings(true, true));
+        assert!(!should_save_settings(false, false));
+        assert!(!should_save_settings(false, true));
+    }
 
     #[test]
     fn lines_range_does_not_panic_on_utf8() {
