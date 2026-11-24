@@ -96,6 +96,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "v${ver}" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match workspace version v${ver}"
+            exit 1
+          fi
+          echo "tag $TAG matches workspace version ${ver}"
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -113,9 +127,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -eu
+          if [ -f "docs/release-notes/${TAG}.md" ]; then
+            notes=(--notes-file "docs/release-notes/${TAG}.md")
+            echo "using docs/release-notes/${TAG}.md"
+          else
+            notes=(--generate-notes)
+            echo "no notes file for ${TAG}, using generated notes"
+          fi
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "mdwriter $TAG" \
-            --generate-notes \
+            --title "mdwriter ${TAG}" \
+            "${notes[@]}" \
             --verify-tag \
             --latest
