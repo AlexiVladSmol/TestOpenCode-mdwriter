@@ -5,6 +5,9 @@ members = ["crates/app", "crates/graph", "crates/index", "crates/markdown", "cra
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
+# Минимум — MSRV egui/eframe 0.37 (1.95); `str::floor_char_boundary`,
+# который использует `crates/index`, стабилизирован раньше.
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/AlexiVladSmol/TestOpenCode-mdwriter"
 
