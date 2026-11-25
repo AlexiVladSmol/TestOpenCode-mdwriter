@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/app", "crates/graph", "crates/index", "crates/markdown", "crates/preview", "crates/vault"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 # Минимум — MSRV egui/eframe 0.37 (1.95); `str::floor_char_boundary`,
 # который использует `crates/index`, стабилизирован раньше.
